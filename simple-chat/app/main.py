@@ -1,0 +1,239 @@
+"""FastAPI 入口：应用装配、生命周期、静态页、全局异常处理、健康检查与中间件。"""
+
+import asyncio
+import logging
+import time
+import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+from app.chat import router as chat_router
+from app.chat.service import shutdown_tasks
+from app.config import settings
+from app.db import get_db, init_db
+from app.errors import AppError, ErrorCode
+from app.llm import client as llm_client
+from app.log import configure_logging
+from app.middleware.body_limit import BodySizeLimitMiddleware
+from app.middleware.rate_limit import RateLimitMiddleware
+
+configure_logging()
+logger = logging.getLogger(__name__)
+
+BASE_DIR = Path(__file__).resolve().parent
+STATIC_DIR = BASE_DIR / "web" / "static"
+
+
+def error_response(
+    status_code: int, code: ErrorCode, message: str, request_id: str | None = None
+) -> JSONResponse:
+    err: dict = {"code": code.value, "message": message}
+    if request_id:
+        err["request_id"] = request_id
+    return JSONResponse(status_code=status_code, content={"error": err})
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db()
+    logger.info("database ready at %s", settings.db_path)
+    yield
+    await shutdown_tasks()
+
+
+app = FastAPI(title="Simple Chat API", version="0.1.0", lifespan=lifespan)
+
+
+# ───────────────────────── 请求日志中间件（结构化 JSON） ─────────────────────────
+class RequestLogMiddleware(BaseHTTPMiddleware):
+    """记录每个请求：request_id / method / path / status / latency_ms / user_id。
+
+    request_id 回写 X-Request-Id 响应头；user_id 取自 X-User-Id（缺失为 anonymous），
+    并写入 request.state 供流式断开日志复用。请求体不记录（隐私）。
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        request_id = request.headers.get("X-Request-Id") or uuid.uuid4().hex
+        request.state.request_id = request_id
+        user_id = request.headers.get("X-User-Id") or "anonymous"
+        request.state.user_id = user_id
+
+        start = time.monotonic()
+        try:
+            response = await call_next(request)
+        except Exception:
+            latency_ms = (time.monotonic() - start) * 1000
+            logger.error(
+                "request_failed",
+                extra={
+                    "request_id": request_id,
+                    "user_id": user_id,
+                    "method": request.method,
+                    "path": request.url.path,
+                    "latency_ms": round(latency_ms, 1),
+                    "event": "request",
+                    "error_code": "UNHANDLED",
+                },
+                exc_info=True,
+            )
+            raise
+
+        latency_ms = (time.monotonic() - start) * 1000
+        response.headers["X-Request-Id"] = request_id
+        logger.info(
+            "request",
+            extra={
+                "request_id": request_id,
+                "user_id": user_id,
+                "method": request.method,
+                "path": request.url.path,
+                "status": response.status_code,
+                "latency_ms": round(latency_ms, 1),
+                "event": "request",
+            },
+        )
+        return response
+
+
+app.add_middleware(BodySizeLimitMiddleware)
+app.add_middleware(RateLimitMiddleware)
+app.add_middleware(RequestLogMiddleware)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origin_list,
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+# ───────────────────────── 健康检查 ─────────────────────────
+@app.get("/healthz", include_in_schema=True, summary="存活探针（不查 DB）")
+async def healthz() -> dict:
+    """轻量存活检查，供负载均衡/容器探针使用；不触碰数据库或模型。"""
+    return {
+        "status": "ok",
+        "version": app.version,
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.get("/readyz", include_in_schema=True, summary="就绪探针（DB + Key + 模型可达）")
+async def readyz() -> JSONResponse:
+    """就绪检查：DB 可达 + LLM_API_KEY 非空 + 模型轻量可达（超时 5s）。
+
+    任一失败返回 503，并在 checks / error 字段中说明原因。
+    """
+
+    def _body(status: str, checks: dict, reason: str | None, error: str | None):
+        payload: dict = {
+            "status": status,
+            "version": app.version,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "checks": checks,
+        }
+        if reason:
+            payload["reason"] = reason
+        if error:
+            payload["error"] = error
+        return JSONResponse(status_code=200 if status == "ok" else 503, content=payload)
+
+    checks: dict = {}
+
+    # 1) DB 可达
+    try:
+        async with get_db() as conn:
+            await conn.execute("SELECT 1")
+        checks["db"] = "ok"
+    except Exception as exc:
+        logger.error(
+            "readyz check failed",
+            extra={"event": "readyz", "error_code": "DB_UNREACHABLE"},
+        )
+        return _body("unavailable", checks, "db_unreachable", str(exc))
+
+    # 2) LLM API Key 非空
+    if not settings.llm_api_key.strip():
+        checks["llm_key"] = "missing"
+        return _body("unavailable", checks, "llm_key_missing", "LLM_API_KEY 未配置")
+    checks["llm_key"] = "ok"
+
+    # 3) 模型轻量可达（5s 超时）
+    try:
+        await asyncio.wait_for(llm_client.ping(), timeout=5.0)
+        checks["model"] = "ok"
+    except Exception as exc:
+        logger.error(
+            "readyz check failed",
+            extra={
+                "event": "readyz",
+                "error_code": getattr(exc, "code", type(exc).__name__),
+            },
+        )
+        return _body("unavailable", checks, "model_unreachable", str(exc))
+
+    return _body("ok", checks, None, None)
+
+
+# ───────────────────────── 首页（注入模型名） ─────────────────────────
+@app.get("/", include_in_schema=False)
+async def index(request: Request) -> HTMLResponse:
+    # 注入 model 名给前端 <meta name="llm-model"> 占位（app.js 读取展示于侧边栏底部）。
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    html = html.replace(
+        'name="llm-model" content=""',
+        f'name="llm-model" content="{settings.llm_model}"',
+    )
+    return HTMLResponse(html)
+
+
+# ───────────────────────── 全局异常处理器 ─────────────────────────
+@app.exception_handler(AppError)
+async def app_error_handler(request: Request, exc: AppError) -> JSONResponse:
+    rid = getattr(request.state, "request_id", None)
+    return error_response(exc.status_code, exc.code, exc.message, rid)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    first = exc.errors()[0] if exc.errors() else {}
+    loc = ".".join(str(p) for p in first.get("loc", []) if p not in ("body", "query"))
+    detail = f"{loc}: {first.get('msg', '参数不合法')}" if loc else "请求参数不合法"
+    rid = getattr(request.state, "request_id", None)
+    return error_response(422, ErrorCode.VALIDATION_ERROR, detail, rid)
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+    if exc.status_code == 404:
+        code = ErrorCode.NOT_FOUND
+    elif exc.status_code == 405:
+        code = ErrorCode.METHOD_NOT_ALLOWED
+    else:
+        code = ErrorCode.INTERNAL_ERROR
+    message = exc.detail if isinstance(exc.detail, str) else "请求失败"
+    rid = getattr(request.state, "request_id", None)
+    return error_response(exc.status_code, code, message, rid)
+
+
+@app.exception_handler(Exception)
+async def unhandled_handler(request: Request, exc: Exception) -> JSONResponse:
+    logger.exception("unhandled error on %s %s", request.method, request.url.path)
+    message = "服务内部错误" if settings.is_production else f"服务内部错误: {exc}"
+    rid = getattr(request.state, "request_id", None)
+    return error_response(500, ErrorCode.INTERNAL_ERROR, message, rid)
+
+
+app.include_router(chat_router.router)  # router 自身已带 prefix="/api/chat"

@@ -1,0 +1,22 @@
+# 密钥与环境（切勿提交）
+.env
+.env.*
+!.env.example
+
+# 运行时数据（SQLite）
+*.db
+*.db-shm
+*.db-wal
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# 测试与覆盖率
+.coverage
+.pytest_cache/
+htmlcov/
