@@ -8,7 +8,7 @@ API="$BASE/api/chat"
 SSE_LOG="${SSE_LOG:-/tmp/sse.log}"
 SECOND_SSE_LOG="${SECOND_SSE_LOG:-/tmp/sse-second.log}"
 RATE_LIMIT_IP="${RATE_LIMIT_IP:-198.51.100.42}"
-RATE_LIMIT_USER="${RATE_LIMIT_USER:-e2e-rate-limit}"
+RATE_LIMIT_USER="${RATE_LIMIT_USER:-e2e-rate-limit-$$}"
 
 for command in curl jq grep awk; do
   command -v "$command" >/dev/null 2>&1 || {

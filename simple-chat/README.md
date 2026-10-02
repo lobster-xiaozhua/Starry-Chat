@@ -283,3 +283,61 @@ K8s 示例：
 | 多实例限流 / 并发锁一致性 | 需评估 | 当前为单实例内存实现；多副本需换 Redis+Lua / 外部锁 |
 
 注：认证（登录 / JWT）仍是 stub（仅 X-User-Id 头），属已知边界；上线前务必补齐真实鉴权，否则 user_id 可被客户端伪造、归属校验形同虚设。
+
+# 发布
+
+## 端到端验收
+
+服务启动后，在仓库根目录执行：
+
+```bash
+bash scripts/e2e.sh
+```
+
+脚本依赖 `curl` 和 `jq`，默认访问 `http://127.0.0.1:8000`，也可通过 `BASE` 指定地址：
+
+```bash
+BASE=https://chat.example.com bash scripts/e2e.sh
+```
+
+验收覆盖健康检查、流式 SSE、SSE `done` 事件中的会话 ID、多轮对话、会话列表与删除、生产限流（第 31 次起返回 429）以及空消息 422。限流步骤使用 `X-Forwarded-For` 与 `X-User-Id` 隔离测试流量；请仅在受控的验收环境运行。
+
+## 成本模型
+
+单次对话成本 = `(prompt_tokens + completion_tokens) * 模型单价`
+
+上下文裁剪直接决定成本：上下文越长，每次调用越贵。MVP 建议：
+
+- `MAX_CONTEXT_TOKENS = 4096`
+- `MAX_RESPONSE_TOKENS = 1024`
+
+月成本估算 = `日均对话数 × 平均轮次 × 平均 token 数 × 单价 × 30`
+
+## 上线前
+
+- [ ] 全部测试通过，覆盖率达标
+- [ ] `.env` 已按生产值配置，API Key 已轮换
+- [ ] `CORS_ORIGINS` 已设为前端域名（非 `*`）
+- [ ] 数据库文件目录已存在且权限 700，属主为运行用户
+- [ ] 已配置 logrotate 或日志大小上限（避免 SQLite 日志撑满磁盘）
+- [ ] 已配置 systemd 重启策略（`Restart=on-failure`, `MaxRestart=5`）
+- [ ] 已压测：wrk / k6 模拟 50 并发流式请求，观察：
+  - 内存增长是否收敛（无泄漏）
+  - 单请求 P95 延迟 < 3s（首 token 延迟）
+  - SQLite 无 `database is locked` 错误
+- [ ] 已验证 Nginx 关闭 `proxy_buffering`
+- [ ] 已验证客户端断开时服务端 LLM 请求被取消（看日志 `client_disconnected`）
+- [ ] 已备份数据库（cron + `sqlite3 .backup`）
+
+## 监控告警
+
+- [ ] 指标：请求 QPS、P50/P95/P99 延迟、流式首 token 延迟、token 用量/用户/天、错误率（按 `error_code` 分）、活跃会话数、SQLite 连接等待数
+- [ ] 告警：5xx 率 > 1%、P95 > 5s、LLM 不可用连续 3 次、磁盘剩余 < 20%、API Key 余额不足
+- [ ] 仪表盘：单图看“请求量 vs 错误率 vs 成本”
+
+## 回滚
+
+- [ ] git tag 版本（`v0.1.0`）
+- [ ] 数据库 schema 向后兼容（只加字段，不改含义）
+- [ ] 回滚命令：`systemctl stop simple-chat && git checkout v0.0.1 && systemctl start simple-chat`
+- [ ] 数据库回滚：SQLite 无迁移工具，靠备份文件还原。
