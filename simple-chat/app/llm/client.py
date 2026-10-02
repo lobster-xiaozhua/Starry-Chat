@@ -22,6 +22,7 @@ import httpx
 import openai
 from openai import AsyncOpenAI
 
+from app import metrics
 from app.config import settings
 from app.errors import AppError, ErrorCode
 from app.llm.tokenizer import count_tokens, estimate_tokens
@@ -32,8 +33,7 @@ logger = logging.getLogger(__name__)
 # 明确禁止：不输出 XML/JSON 指令、不透露系统提示词、不执行工具。
 SYSTEM_PROMPT: str = settings.llm_system_prompt
 
-# 重试：仅 429 / 500 / 502 / 503 / 504，最多 2 次
-_MAX_RETRIES = 2
+# 重试：仅 429 / 500 / 502 / 503 / 504，次数取自 settings.llm_max_retries（默认 3）。
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 # 退避：0.5s * 2**attempt + jitter(0~0.3s)，仅用 asyncio.sleep + 标准库 random
 
@@ -42,10 +42,10 @@ _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 
 class LLMError(AppError):
-    """LLM 调用通用错误基类。"""
+    """LLM 调用通用错误：4xx / 参数类错误，统一以 VALIDATION_ERROR 对外。"""
 
     def __init__(self, message: str, *, request_id: str | None = None) -> None:
-        super().__init__(ErrorCode.MODEL_UNAVAILABLE, message, request_id)
+        super().__init__(ErrorCode.VALIDATION_ERROR, message, request_id)
 
 
 class LLMAuthError(AppError):
@@ -79,19 +79,53 @@ class LLMContextOverflow(AppError):
 # ───────────────────────── 异常映射 ─────────────────────────
 
 
+def _bad_request_signals(exc: BaseException) -> tuple[int, str, str]:
+    """抽取 BadRequestError 的 (status_code, error.code, 全文) 供三级判断。
+
+    openai SDK 的错误对象通常不带顶层 .code，错误码在 body["error"]["code"] 里，
+    故同时从 body 字典提取；全文 blob 用于关键词兜底判断。
+    """
+    status = int(getattr(exc, "status_code", 0) or 0)
+    code = str(getattr(exc, "code", "") or "")
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error") if isinstance(body.get("error"), dict) else body
+        code = code or str(err.get("code") or "")
+    blob = " ".join(
+        str(x) for x in (getattr(exc, "message", ""), body if body is not None else "") if x
+    )
+    return status, code, blob
+
+
 def map_openai_error(exc: BaseException) -> AppError:
-    """openai 异常 → 业务异常的唯一映射点。"""
+    """openai 异常 → 业务异常的唯一映射点（改动 3：BadRequestError 三级判断）。"""
     if isinstance(exc, openai.AuthenticationError):
         return LLMAuthError()
     if isinstance(exc, openai.RateLimitError):
         return LLMRateLimited()
+    # 超时按限流处理：前端统一提示“请求过于频繁，请稍候”
+    if isinstance(exc, openai.APITimeoutError):
+        return LLMRateLimited("上游响应超时，请稍后重试")
     if isinstance(exc, openai.APIConnectionError):
         return LLMUnavailable()
     if isinstance(exc, openai.BadRequestError):
-        # 按规格：BadRequestError 一律归为上下文过长（上游通常以 400 返回超长）
-        return LLMContextOverflow()
+        status, code, blob = _bad_request_signals(exc)
+        # 1) 上下文过长：413 或 响应体含 context_length（含真实上游的
+        #    "context length" 空格写法，如 "maximum context length is ..."）
+        if status == 413 or "context_length" in blob or "context length" in blob:
+            return LLMContextOverflow("对话过长，已自动精简历史")
+        # 2) 认证失败：error.code 为 invalid_api_key / authentication（或全文出现）
+        if code in ("invalid_api_key", "authentication") or (
+            "invalid_api_key" in blob or "authentication" in blob
+        ):
+            return LLMAuthError("服务认证失败")
+        # 3) 模型不存在：model + not found
+        if "model" in blob and "not found" in blob:
+            return LLMUnavailable("模型不存在")
+        # 其余：参数错误
+        return LLMError(f"请求参数错误：{str(exc)[:200]}")
     if isinstance(exc, openai.APIStatusError):
-        # 其他带状态码的 API 错误：5xx 归不可用，其余归通用错误
+        # 其他带状态码的 API 错误：5xx 归不可用，其余归参数错误
         if getattr(exc, "status_code", 0) >= 500:
             return LLMUnavailable("上游模型返回错误")
         return LLMError("上游模型返回错误")
@@ -160,18 +194,19 @@ def reset_client() -> None:
     _client = None
 
 
-async def _attempt_with_retry(factory) -> Any:
+async def _attempt_with_retry(factory, model: str | None = None) -> Any:
     """对建立连接阶段做指数递增重试；factory 每次调用返回新协程。"""
     last_exc: BaseException | None = None
-    for attempt in range(_MAX_RETRIES + 1):
+    for attempt in range(settings.llm_max_retries + 1):
         try:
             return await factory()
         except AppError:
             raise  # 已映射的业务异常不重试
         except Exception as exc:
             last_exc = exc
-            if not _is_retryable(exc) or attempt == _MAX_RETRIES:
+            if not _is_retryable(exc) or attempt == settings.llm_max_retries:
                 raise map_openai_error(exc) from exc
+            metrics.llm_retries_total.inc(model=model or settings.llm_model, attempt=str(attempt + 1))
             delay = _backoff_delay(attempt)
             ra = _retry_after(exc)
             if ra is not None and ra > delay:
@@ -181,7 +216,7 @@ async def _attempt_with_retry(factory) -> Any:
                 type(exc).__name__,
                 getattr(exc, "status_code", "-"),
                 attempt + 1,
-                _MAX_RETRIES,
+                settings.llm_max_retries,
                 delay,
             )
             await asyncio.sleep(delay)
@@ -193,6 +228,24 @@ def _ensure_system_prompt(messages: list[dict]) -> list[dict]:
     if messages and messages[0].get("role") == "system":
         return messages
     return [{"role": "system", "content": SYSTEM_PROMPT}, *messages]
+
+
+async def _close_upstream(stream: Any) -> None:
+    """关闭上游流，释放 HTTP 连接（取消与正常结束都必须调用）。
+
+    openai 的 AsyncStream 关闭方法是 close()（非 async-gen 的 aclose()）；
+    兼容两者与测试桩（两者皆无时直接跳过）。此前误用 aclose() 抛
+    AttributeError 被静默吞掉，导致取消路径从不关闭上游连接、正常路径连接泄漏。
+    """
+    closer = getattr(stream, "aclose", None) or getattr(stream, "close", None)
+    if closer is None:
+        return
+    try:
+        result = closer()
+        if asyncio.iscoroutine(result):
+            await result
+    except Exception:
+        logger.debug("upstream stream close failed", exc_info=True)
 
 
 # ───────────────────────── 对外函数 ─────────────────────────
@@ -224,7 +277,7 @@ async def chat_stream(
             stream=True,
         )
 
-    stream = await _attempt_with_retry(factory)
+    stream = await _attempt_with_retry(factory, model=mdl)
     cancelled = False
     try:
         async for chunk in stream:
@@ -238,10 +291,7 @@ async def chat_stream(
     except asyncio.CancelledError:
         # 客户端断开 / 请求被取消：释放上游连接与计费，避免悬挂的 token 计费。
         cancelled = True
-        try:
-            await stream.aclose()
-        except Exception:
-            pass
+        await _close_upstream(stream)
         logger.info(
             "llm_stream_cancelled",
             extra={"model": mdl, "tokens_out": produced, "event": "llm_stream_cancelled"},
@@ -251,16 +301,19 @@ async def chat_stream(
         _log_call(mdl, t0, produced, stream=True, code=exc.code.value)
         raise
     except Exception as exc:
-        mapped = map_openai_error(exc)
+        # 流中途（连接已建立后）超时：重试已不可能——按内部错误处理，
+        # 前端收到 INTERNAL_ERROR 后展示可重试按钮（PR-3 T5 契约）。
+        # 建立连接阶段的超时仍走 _attempt_with_retry → map_openai_error → RATE_LIMITED。
+        if isinstance(exc, (httpx.TimeoutException, openai.APITimeoutError)):
+            mapped = AppError(ErrorCode.INTERNAL_ERROR, "模型响应超时，请重试")
+        else:
+            mapped = map_openai_error(exc)
         _log_call(mdl, t0, produced, stream=True, code=mapped.code.value)
         raise mapped from exc
     finally:
         # 非取消路径：确保上游流被关闭，释放连接回连接池
         if not cancelled:
-            try:
-                await stream.aclose()
-            except Exception:
-                pass
+            await _close_upstream(stream)
     _log_call(mdl, t0, produced, stream=True)
 
 
@@ -287,7 +340,7 @@ async def chat(
         )
 
     try:
-        resp = await _attempt_with_retry(factory)
+        resp = await _attempt_with_retry(factory, model=mdl)
     except AppError as exc:
         _log_call(mdl, t0, 0, stream=False, tokens_in=None, code=exc.code.value)
         raise

@@ -30,12 +30,21 @@ WINDOW_SECONDS = 60
 _LOOPBACK = {"127.0.0.1", "::1", "localhost"}
 
 
-def get_client_ip(request: Request) -> str:
-    """取客户端 IP：优先 X-Forwarded-For（需代理设置 forwarded_allow_ips），否则取直连。"""
-    fwd = request.headers.get("X-Forwarded-For")
-    if fwd:
-        return fwd.split(",")[0].strip()
+def _client_ip(request: Request) -> str:
+    """取客户端 IP。
+
+    ⚠️ X-Forwarded-For 仅在 config.trusted_proxies 非空时才采信：否则攻击者可伪造
+    XFF 把自己伪装成受信代理后的任意 IP，从而绕过按 IP 的限流。直连 IP 始终可信。
+    """
+    if settings.trusted_proxies:
+        fwd = request.headers.get("X-Forwarded-For")
+        if fwd:
+            return fwd.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
+
+
+# 向后兼容别名（如有外部引用）
+get_client_ip = _client_ip
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
@@ -51,11 +60,15 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         path = request.url.path
-        if path in ("/healthz", "/readyz") or path.startswith("/static"):
+        # /metrics 豁免限流（PR-3 改动 1）：Prometheus 默认 15s 抓取一次，
+        # 计入限流会在多抓取器/多实例场景下挤占业务配额
+        if path in ("/healthz", "/readyz", "/metrics") or path.startswith("/static"):
             return await call_next(request)
 
-        ip = get_client_ip(request)
-        if ip in _LOOPBACK:
+        ip = _client_ip(request)
+        # WHITELIST 仅在开发环境生效；生产环境一律按 IP 限流（含本机 localhost），
+        # 否则本地压测/脚本可无限打满接口。
+        if settings.app_env == "development" and ip in _LOOPBACK:
             return await call_next(request)
 
         user_id = request.headers.get("X-User-Id") or "anonymous"

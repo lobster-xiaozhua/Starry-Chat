@@ -26,6 +26,8 @@ async def _post(client, user=None, ip=_FORWARDED_IP):
 
 async def test_rate_limit_returns_429_after_limit(client, monkeypatch):
     monkeypatch.setattr(settings, "rate_limit_enabled", True)
+    # PR-2 改动 4：XFF 仅在 trusted_proxies 非空时才被采信
+    monkeypatch.setattr(settings, "trusted_proxies", [_FORWARDED_IP])
 
     limited = False
     headers_seen = {}
@@ -52,6 +54,8 @@ async def test_rate_limit_returns_429_after_limit(client, monkeypatch):
 async def test_rate_limit_per_user_isolation(client, monkeypatch):
     """不同 user 各自独立计数：alice 被打满，bob 仍可用。"""
     monkeypatch.setattr(settings, "rate_limit_enabled", True)
+    # PR-2 改动 4：XFF 仅在 trusted_proxies 非空时才被采信
+    monkeypatch.setattr(settings, "trusted_proxies", [_FORWARDED_IP])
 
     # alice 触发限流
     res = None

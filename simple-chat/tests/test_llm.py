@@ -14,6 +14,7 @@ import httpx
 import openai
 import pytest
 
+from app.config import settings
 from app.llm import client as llm_client
 from app.llm import tokenizer
 from app.llm.client import (
@@ -306,10 +307,12 @@ async def test_retry_uses_exponential_backoff(monkeypatch):
     with pytest.raises(LLMRateLimited):
         _ = [p async for p in chat_stream([{"role": "user", "content": "x"}])]
 
-    # 2 次重试 → 2 次 sleep，延迟应为 0.5 * 2**0 与 0.5 * 2**1
-    assert len(delays) == 2
-    assert delays[0] == pytest.approx(0.5)
-    assert delays[1] == pytest.approx(1.0)
+    # 重试次数读自 settings.llm_max_retries（PR-2 改动 8：默认 3），
+    # N 次重试 → N 次 sleep，延迟应为 0.5 * 2**i
+    retries = settings.llm_max_retries
+    assert len(delays) == retries
+    for i, d in enumerate(delays):
+        assert d == pytest.approx(0.5 * 2 ** i)
 
 
 def _append(lst: list, val: Any) -> asyncio.Future:
@@ -321,14 +324,14 @@ def _append(lst: list, val: Any) -> asyncio.Future:
 
 
 async def test_no_retry_on_400_bad_request(fast_retry):
-    """400 不可重试，首次即抛 LLMContextOverflow（规格：BadRequestError 一律归上下文过长）。"""
+    """400 不可重试，无关键词的 BadRequestError 首次即抛 LLMError（PR-2 改动 3）。"""
     exc = openai.BadRequestError(
         "bad", response=_make_response(400, {"error": {"message": "nope"}}), body=None
     )
     completions = StubCompletions(stream_chunks=["ok"], exc=exc)
     llm_client.set_client(StubAsyncOpenAI(completions))
 
-    with pytest.raises(LLMContextOverflow):
+    with pytest.raises(LLMError):
         _ = [p async for p in chat_stream([{"role": "user", "content": "x"}])]
 
     assert len(completions.calls) == 1  # 未重试
@@ -424,7 +427,8 @@ def test_map_openai_error_unit():
     plain_bad = openai.BadRequestError(
         "plain bad", response=_make_response(400, {"error": {"message": "nope"}}), body=None
     )
-    assert isinstance(map_openai_error(plain_bad), LLMContextOverflow)
+    # PR-2 改动 3：无关键词的 BadRequestError 不再一律归上下文过长，归参数错误
+    assert isinstance(map_openai_error(plain_bad), LLMError)
     # 5xx APIStatusError → LLMUnavailable
     server_err = openai.APIStatusError(
         "server boom", response=_make_response(502, {}), body=None

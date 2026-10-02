@@ -16,6 +16,26 @@
 
 const API_BASE = "/api/chat";
 
+// 错误码 → 面向用户文案（改动 3）。后端 SSE/HTTP 错误体恒为 {"code","message"}，
+// 优先用后端 message（已含具体信息，如“请求参数错误：xxx”）；message 缺失时回退到本表。
+const ERRORS = {
+  VALIDATION_ERROR: "请求参数错误",
+  AUTH_ERROR: "服务认证失败",
+  MODEL_UNAVAILABLE: "模型不存在",
+  CONTEXT_OVERFLOW: "对话过长，已自动精简历史",
+  RATE_LIMITED: "请求过于频繁，请稍候",
+  CONVERSATION_BUSY: "该会话正在生成回复，请稍候",
+  INTERNAL_ERROR: "服务内部错误，请稍后重试",
+  NOT_FOUND: "资源不存在",
+};
+
+function errText(payload) {
+  const code = payload?.code;
+  const message = payload?.message || "";
+  if (message) return message;
+  return (code && ERRORS[code]) || "请求失败";
+}
+
 // ───────────────────────── DOM 引用 ─────────────────────────
 const $ = (id) => document.getElementById(id);
 const sidebarEl = $("sidebar");
@@ -90,6 +110,40 @@ function renderMarkdown(text) {
 // - 剥离 on* 事件属性、javascript: 与 data: 链接
 // - 代码块包裹 .code-wrap + 复制按钮
 // - 外链加 rel/target
+// Layer C：DOMPurify 不可用时的最后防线（纯正则，断网 / CDN 失败兜底，改动 2）。
+// 必须剥离的标签：script style svg math details iframe object embed
+//   link meta base form input button textarea select option template slot
+// 必须剥离的属性：on\w+、href、src、srcdoc、style、formaction、action
+// 保留的合法属性：class、id、data-*、width、height、colspan、rowspan、target、rel
+// 关键：pre/code 内的内联 style 属于用户代码片段语义，仅当标签非 pre/code 时剥离。
+function escapeFallback(html) {
+  let out = String(html == null ? "" : html);
+  // 1) 危险标签：script/style 连同内容一并删除；其余仅删标签、保留内部文本
+  out = out.replace(
+    /<\/?(?:script|style|iframe|object|embed|link|meta|base|form|input|button|textarea|select|option|template|slot)\b[^>]*>/gi,
+    ""
+  );
+  out = out.replace(/<\/?(?:svg|math|details)\b[^>]*>/gi, "");
+  // 2) 事件属性 on\w+
+  out = out.replace(/\s+on\w+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "");
+  // 3) 危险属性 href/src/srcdoc/formaction/action（含 javascript:/data: 链接）
+  out = out.replace(
+    /\s+(?:href|src|srcdoc|formaction|action)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi,
+    ""
+  );
+  // 4) style：仅当标签非 pre/code 时剥离（保留代码块内联样式语义）
+  out = out.replace(
+    /<([a-zA-Z][\w-]*)((?:\s+[^>]*)?)>/g,
+    (full, tag, attrs) => {
+      const t = tag.toLowerCase();
+      if (t === "pre" || t === "code") return full;
+      const cleaned = attrs.replace(/\s+style\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/i, "");
+      return `<${tag}${cleaned}>`;
+    }
+  );
+  return out;
+}
+
 function finalizeAssistantHtml(container, html) {
   // 0. XSS 防护：优先 DOMPurify 一次性净化（剥离 script/style/on*/javascript:/data: 等）；
   //    加载失败则回退到手动剥离危险节点与事件属性。无论如何，用户输入都不会直接 innerHTML。
@@ -100,20 +154,8 @@ function finalizeAssistantHtml(container, html) {
       ADD_ATTR: ["target"],
     });
   } else {
-    container.innerHTML = html;
-    container
-      .querySelectorAll("script, style, iframe, object, embed, link, meta, form")
-      .forEach((n) => n.remove());
-    container.querySelectorAll("*").forEach((node) => {
-      for (const attr of [...node.attributes]) {
-        const name = attr.name.toLowerCase();
-        const val = attr.value || "";
-        if (name.startsWith("on")) node.removeAttribute(attr.name);
-        if ((name === "href" || name === "src") && /^\s*(javascript|data)\s*:/i.test(val)) {
-          node.removeAttribute(attr.name);
-        }
-      }
-    });
+    // DOMPurify 不可用：回退到纯正则 escapeFallback（最后防线，见改动 2 Layer C）
+    container.innerHTML = escapeFallback(html);
   }
 
   // 1. 代码块：marked 输出 <pre><code>，外层包 .code-wrap + 复制按钮
@@ -537,7 +579,7 @@ async function send() {
         } else if (parsed.event === "error") {
           // 带内错误：在消息流末尾追加红色错误条 + 重试
           finalizeAbortedAssistant();
-          appendErrorBar(parsed.data.message || "生成失败", () => retry());
+          appendErrorBar(errText(parsed.data), () => retry());
           return;
         }
       }
@@ -571,9 +613,9 @@ function handleSendError(err) {
     appendErrorBar("请求过于频繁，请稍后再试", () => retry());
     return;
   }
-  // 其它：用错误体 message
+  // 其它：用错误体 message（或 ERRORS 回退文案）
   finalizeAbortedAssistant();
-  appendErrorBar(err.message || "发送失败", () => retry());
+  appendErrorBar(errText(err), () => retry());
 }
 
 // 主动停止 / 异常时把流式气泡收尾成已有文本（去掉 typing dots）

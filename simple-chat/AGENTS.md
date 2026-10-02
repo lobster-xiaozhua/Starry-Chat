@@ -160,9 +160,9 @@ into _attempt_with_retry.
   --cov=app --cov-report=term-missing to check.
 - To inject a custom LLM client from a test, use app.llm.client.set_client(...) /
   reset_client() (the module-level singleton).
-- scripts/retry_e2e.py and scripts/retry_5xx.py reference an LLMClient class / RETRY_DELAYS
-  that do NOT exist in the current app/llm/client.py - they appear stale; do not trust them as
-  working examples. The authoritative e2e check is scripts/e2e.sh.
+- The stale retry demo scripts (retry_e2e.py / retry_5xx.py) were removed in PR-2: they
+  imported a client class and retry-constant names that never existed in app/llm/client.py.
+  The authoritative e2e check is scripts/e2e.sh.
 
 ## Known intentionally-out-of-scope (MVP)
 

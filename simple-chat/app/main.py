@@ -11,13 +11,15 @@ from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from app import metrics
+from app.admin import router as admin_router
 from app.chat import router as chat_router
-from app.chat.service import shutdown_tasks
+from app.chat.service import shutdown_tasks, _reap_locks
 from app.config import settings
 from app.db import get_db, init_db
 from app.errors import AppError, ErrorCode
@@ -46,8 +48,17 @@ def error_response(
 async def lifespan(app: FastAPI):
     await init_db()
     logger.info("database ready at %s", settings.db_path)
-    yield
-    await shutdown_tasks()
+    # 后台回收会话锁残留条目（防 dict 无限增长 / 异常崩溃泄漏）
+    reaper = asyncio.create_task(_reap_locks())
+    try:
+        yield
+    finally:
+        reaper.cancel()
+        try:
+            await reaper
+        except asyncio.CancelledError:
+            pass
+        await shutdown_tasks()
 
 
 app = FastAPI(title="Simple Chat API", version="0.1.0", lifespan=lifespan)
@@ -66,6 +77,8 @@ class RequestLogMiddleware(BaseHTTPMiddleware):
         request.state.request_id = request_id
         user_id = request.headers.get("X-User-Id") or "anonymous"
         request.state.user_id = user_id
+        # PR-3 改动 1：trace_id 经 contextvars 透传，供慢查询等内部日志关联请求
+        metrics.trace_id.set(request_id)
 
         start = time.monotonic()
         try:
@@ -117,6 +130,20 @@ app.add_middleware(
 )
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+# ───────────────────────── Prometheus 指标 ─────────────────────────
+@app.get("/metrics", include_in_schema=False, summary="Prometheus 指标（PR-3 改动 1）")
+async def prometheus_metrics():
+    """暴露 Prometheus text format 指标。
+
+    - 不参与限流（rate_limit 豁免名单）、不参与鉴权（无用户态）。
+    - 本端点自身不产生任何 chat_* 指标更新（chat_requests_total 只在 chat
+      路径递增，避免自增风暴）。
+    - 生产建议：仅监听 127.0.0.1 或由反向代理（docs/nginx.conf）做 IP 白名单。
+    """
+    metrics.refresh_process_memory()
+    return Response(content=metrics.render(), media_type=metrics.CONTENT_TYPE)
 
 
 # ───────────────────────── 健康检查 ─────────────────────────
@@ -237,3 +264,4 @@ async def unhandled_handler(request: Request, exc: Exception) -> JSONResponse:
 
 
 app.include_router(chat_router.router)  # router 自身已带 prefix="/api/chat"
+app.include_router(admin_router)  # /api/admin/cost（PR-3 改动 2）

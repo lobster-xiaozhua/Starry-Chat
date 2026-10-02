@@ -1,0 +1,7 @@
+# 开发/测试专用依赖（不进生产镜像）。
+-r requirements.txt
+
+# PR-3 改动 3：respx 拦截 openai SDK 的上游 HTTP（e2e SSE 测试）
+respx>=0.21,<0.22
+# PR-3 改动 4：aiohttp 作为压测客户端与 e2e 原始字节流读取
+aiohttp>=3.9,<3.11

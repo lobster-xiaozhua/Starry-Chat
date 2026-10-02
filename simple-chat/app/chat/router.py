@@ -5,9 +5,11 @@
 """
 
 import asyncio
+import functools
 import json
 import logging
 
+import anyio
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import StreamingResponse
 
@@ -23,6 +25,48 @@ from app.schema import (
     MessageListOut,
     Usage,
 )
+from starlette.types import Receive, Scope, Send
+
+
+class DisconnectAwareStreamingResponse(StreamingResponse):
+    """断开感知的 SSE 流式响应（PR-3 改动 3 的生产前提修复）。
+
+    背景：uvicorn 0.30 在客户端断开后只在 receive 通道标记 http.disconnect，
+    对 send() 一律静默丢弃、从不取消 ASGI 任务；而 Starlette 0.46 在
+    ASGI spec_version >= 2.4 时移除了自身的 disconnect 监听（约定“由服务端
+    取消任务”）。两者组合的实际行为 = 客户端断开后流继续跑完，上游 LLM
+    持续计费，_sse_stream/_do_stream 的清理链永远不会执行。
+
+    本类恢复 Starlette 经典模式：并发监听 receive，收到 http.disconnect 即
+    取消流式任务，使整条生成器链（→ _do_stream → chat_stream）确定性关闭，
+    上游 HTTP 连接与计费立即释放。
+    """
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        spec = tuple(map(int, scope.get("asgi", {}).get("spec_version", "2.0").split(".")))
+        if spec < (2, 4):
+            # 旧路径：父类自带 disconnect 监听
+            await super().__call__(scope, receive, send)
+            return
+
+        async with anyio.create_task_group() as task_group:
+
+            async def wrap(func):
+                try:
+                    await func()
+                finally:
+                    # 任一方结束（流完成 或 客户端断开）都取消另一方
+                    task_group.cancel_scope.cancel()
+
+            task_group.start_soon(wrap, functools.partial(self.stream_response, send))
+            await wrap(functools.partial(self._listen_for_disconnect, receive))
+
+    @staticmethod
+    async def _listen_for_disconnect(receive: Receive) -> None:
+        while True:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                break
 
 logger = logging.getLogger(__name__)
 
@@ -30,10 +74,15 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
 # 流式响应必须设置的头：禁用缓存与代理缓冲，保证逐字推送。
+# - X-Accel-Buffering: no      → 防止 Nginx 缓冲 SSE（改动 6 的 nginx.conf 亦设 proxy_buffering off 兜底）
+# - Content-Type               → 显式 text/event-stream + charset，避免客户端按默认 MIME 解析
+# - Cache-Control: no-cache, no-transform → 禁止中间代理改写/转码分块
+# - Connection: keep-alive    → 复用长连接，降低首 token 延迟
 SSE_HEADERS = {
-    "Cache-Control": "no-cache",
+    "X-Accel-Buffering": "no",
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache, no-transform",
     "Connection": "keep-alive",
-    "X-Accel-Buffering": "no",  # 防止 Nginx 缓冲 SSE
 }
 
 
@@ -80,9 +129,14 @@ async def _sse_stream(gen, conversation_id, request_id, user_id):
                 "user_id": user_id,
             },
         )
-        return
+        # 必须继续上抛：anyio 取消域内吞掉 CancelledError 会破坏任务组状态；
+        # 清理在 finally 中 shield 完成。
+        raise
     finally:
-        await gen.aclose()
+        # 关闭内层生成器触发其清理链（释放会话锁 / 关闭上游流 / 指标回收）。
+        # 取消场景下本任务处于已取消作用域，需 shield 才能让清理 await 跑完。
+        with anyio.CancelScope(shield=True):
+            await gen.aclose()
 
 
 @router.post("", summary="发送消息（流式 SSE 或 JSON）")
@@ -98,7 +152,7 @@ async def chat(body: ChatRequest, conn: DbDep, user_id: UserIdDep, request: Requ
     gen = await service.send_message(body, conn, user_id)
     request_id = getattr(request.state, "request_id", None)
     if body.stream:
-        return StreamingResponse(
+        return DisconnectAwareStreamingResponse(
             _sse_stream(gen, body.conversation_id, request_id, user_id),
             media_type="text/event-stream",
             headers=SSE_HEADERS,

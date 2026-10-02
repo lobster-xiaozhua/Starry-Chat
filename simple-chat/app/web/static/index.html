@@ -3,13 +3,18 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src * data:; connect-src 'self'" />
 <meta name="llm-model" content="" />
 <title>Simple Chat</title>
-<!-- Markdown 渲染依赖：仅外部 CDN（marked）；XSS 防护统一交给 DOMPurify。
-     流式期间只用纯文本追加，流结束后才 markdown -> html，避免半截 HTML 崩溃。
-     DOMPurify 若加载失败，finalizeAssistantHtml 会回退到手动剥离危险节点（见 app.js）。 -->
-<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js" defer></script>
-<script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js" defer></script>
+<!-- Markdown 渲染依赖：改为本地 vendor（断网可用 + SRI 完整性校验），不再依赖外部 CDN。
+     XSS 防护三层（改动 2）：A. vendor 进仓库 + SRI；B. 上方 CSP meta；C. app.js 的
+     escapeFallback 在 DOMPurify 加载失败时作最后正则兜底。 -->
+<script src="/static/vendor/marked.min.js" defer
+  integrity="sha384-9Md4MlJk24bo2Ifubp0FbKhuES4/iAwyTGMeWpBG4RoHGTKygpEGEpOYhEQxbfa9"
+  crossorigin="anonymous"></script>
+<script src="/static/vendor/purify.min.js" defer
+  integrity="sha384-eEu5CTj3qGvu9PdJuS+YlkNi7d2XxQROAFYOr59zgObtlcux1ae1Il3u7jvdCSWu"
+  crossorigin="anonymous"></script>
 <style>
   :root {
     /* 配色：浅色模式优先，CSS 变量驱动，主色 teal-700 #0f766e */

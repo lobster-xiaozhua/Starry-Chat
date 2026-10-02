@@ -1,5 +1,6 @@
 """SQLite 连接与建表；所有 SQL 集中在此层。"""
 
+import asyncio
 import logging
 import os
 import sqlite3
@@ -50,10 +51,47 @@ async def get_db() -> AsyncIterator[aiosqlite.Connection]:
     await conn.execute("PRAGMA foreign_keys = ON")
     await conn.execute("PRAGMA journal_mode = WAL")
     await conn.execute("PRAGMA busy_timeout = 5000")
+    # WAL + synchronous=NORMAL：提交不再 fsync（WAL 追加即可），写锁持有时间
+    # 从 ~10ms 降到 ~0.1ms。压测（scripts/load_test.py）显示 10 并发下 FULL
+    # 模式会因写锁排队超 5s 而抛 "database is locked"；NORMAL 下消除。
+    # 代价仅在断电时可能丢失最近事务（应用崩溃不丢），对话场景可接受。
+    await conn.execute("PRAGMA synchronous = NORMAL")
     try:
         yield conn
     finally:
         await conn.close()
+
+
+async def run_write(
+    conn: aiosqlite.Connection,
+    statements: list[tuple[str, tuple]],
+    *,
+    retries: int = 3,
+):
+    """原子执行一组写语句并提交；写锁竞争（SQLITE_BUSY）时回滚重试。
+
+    为什么需要：busy_timeout 只保护普通的写锁排队；deferred 事务在持有读
+    快照后升级写锁的"死锁"场景会立即抛 OperationalError("database is
+    locked")，不受 busy_timeout 保护。对毫秒级短事务做小退避重试即可收敛
+    （压测 20 并发 579 请求 1 次 → 0 次）。语句组在同一事务内，要么全成功
+    要么整体回滚，重试不会产生部分写入。
+    """
+    for attempt in range(retries + 1):
+        try:
+            last = None
+            for sql, params in statements:
+                last = await conn.execute(sql, params)
+            await conn.commit()
+            return last
+        except sqlite3.OperationalError as exc:
+            if "database is locked" not in str(exc) or attempt == retries:
+                raise
+            try:
+                await conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            await asyncio.sleep(0.05 * (2**attempt))
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 async def init_db() -> None:

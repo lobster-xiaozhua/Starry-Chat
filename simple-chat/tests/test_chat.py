@@ -303,7 +303,17 @@ async def test_model_error_mapping(client, monkeypatch):
             ErrorCode.AUTH_ERROR,
         ),
         (
+            # PR-2 改动 3：无关键词的 BadRequestError 归参数错误（VALIDATION_ERROR）
             openai.BadRequestError("bad", response=_resp(400), body=None),
+            ErrorCode.VALIDATION_ERROR,
+        ),
+        (
+            # 413 / context_length 关键词仍归上下文过长
+            openai.BadRequestError(
+                "ctx",
+                response=_resp(413),
+                body={"error": {"code": "context_length_exceeded", "message": "too long"}},
+            ),
             ErrorCode.CONTEXT_OVERFLOW,
         ),
     ]
@@ -320,5 +330,5 @@ async def test_model_error_mapping(client, monkeypatch):
     # 规格中“429 / 500”对应 ErrorCode 的 http_status 语义校验
     assert ErrorCode.RATE_LIMITED.http_status == 429
     assert ErrorCode.AUTH_ERROR.http_status == 500
-    # 注：BadRequestError 在代码中映射为 CONTEXT_OVERFLOW（http_status=413），
-    # 此处断言的是 SSE error 事件的 code，与契约一致。
+    # 注：BadRequestError 按 PR-2 改动 3 三级映射（413/关键词→CONTEXT_OVERFLOW，
+    # 认证→AUTH_ERROR，model not found→MODEL_UNAVAILABLE，其余→VALIDATION_ERROR）。

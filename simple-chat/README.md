@@ -85,15 +85,16 @@ simple-chat/
 | `LLM_BASE_URL` | `http://127.0.0.1:3000/v1` | OpenAI 兼容端点 |
 | `LLM_API_KEY` | 空 | 开发环境可留空；生产必填 |
 | `LLM_MODEL` | `sensenova-6.8-flash-lite` | 对话模型 |
-| `LLM_MAX_TOKENS` | `64000` | 单次回答上限 |
+| `LLM_MAX_TOKENS` | `8192` | 单次回答上限 |
 | `LLM_TEMPERATURE` | `0.7` | 采样温度 |
-| `LLM_MAX_RETRIES` | `5` | 上游可恢复错误（429/5xx/超时）的重试次数，指数递增退避 |
-| `MAX_CONTEXT_TOKENS` | `256000` | 上下文 token 预算，超出从最旧丢弃 |
+| `LLM_MAX_RETRIES` | `3` | 上游可恢复错误（429/5xx/超时）的重试次数，指数递增退避 |
+| `MAX_CONTEXT_TOKENS` | `8192` | 上下文 token **总预算**（含系统提示与回复预留），非单次回答的 `max_tokens`；超出从最旧丢弃 |
 | `CORS_ORIGINS` | `*` | 逗号分隔的允许来源；**生产环境切勿设为 `*`** |
 | `LOG_LEVEL` | `INFO` | 日志级别（开发可设 DEBUG） |
 | `RATE_LIMIT_ENABLED` | 由环境推导 | 限流开关；不设置时：生产=开、开发=关。可显式设为 true/false |
 | `PROXY_HEADERS` | `true` | 是否信任反向代理的 X-Forwarded-* 头（仅生产生效） |
 | `FORWARDED_ALLOW_IPS` | `*` | 允许设置转发头的代理 IP（生产建议收敛为具体网段） |
+| `TRUSTED_PROXIES` | `[]` | 受信反向代理 IP 列表；**仅当非空**时才采信 `X-Forwarded-For` 取真实客户端 IP（防伪造 XFF 绕过限流） |
 | `WORKERS` | 由 CPU 核心数推导 | 生产 uvicorn worker 数；不设置则取 CPU 核心数 |
 | `MAX_BODY_BYTES` | `1048576` | 请求体大小上限（1MB），超出返回 413 |
 
@@ -308,10 +309,40 @@ BASE=https://chat.example.com bash scripts/e2e.sh
 
 上下文裁剪直接决定成本：上下文越长，每次调用越贵。MVP 建议：
 
-- `MAX_CONTEXT_TOKENS = 4096`
+- `MAX_CONTEXT_TOKENS = 8192`
 - `MAX_RESPONSE_TOKENS = 1024`
 
 月成本估算 = `日均对话数 × 平均轮次 × 平均 token 数 × 单价 × 30`
+
+## 成本（/api/admin/cost）
+
+按用户聚合的 token 用量与成本账单（PR-3 改动 2）：
+
+```bash
+# 未配置 ADMIN_API_KEY 时端点返回 501（local-first：不强制启用）
+curl 'http://localhost:8000/api/admin/cost?from=2026-09-25&to=2026-10-02' \
+     -H "X-Admin-Key: $ADMIN_API_KEY"
+```
+
+返回 `by_user`（每用户 prompt/completion tokens、cost_usd、requests）与 `total`，
+直接 SQL SUM + GROUP BY 聚合，结果缓存 60s。时间范围默认最近 7 天，最大 90 天。
+
+价格按模型配置（未配置则 cost_usd=0，不报错）：
+
+```bash
+# .env —— 注意 pydantic-settings 对 dict 只接受 JSON 格式
+MODEL_PRICE={"sensenova-6.8-flash-lite": {"prompt": 0.15, "completion": 0.60}}
+ADMIN_API_KEY=change-me
+```
+
+**防止单用户刷爆账单**：
+
+1. 限流（见【部署 → 限流】）：生产环境默认 30 次/60s（user_id+IP 维度），
+   可按 `RATE_LIMIT` 收紧；对重点用户可在反向代理层（`docs/nginx.conf` 的
+   `limit_req`）再叠一层 IP 级漏桶。
+2. 每日盯 `cost_usd` 增量：`/api/admin/cost?from=<今天>` 的 `total.cost_usd`
+   就是当日累计账单，接告警超阈值即告警。
+3. `MAX_CONTEXT_TOKENS`（默认 8192）直接决定单次请求的 prompt 成本上限。
 
 ## 上线前
 
@@ -329,10 +360,39 @@ BASE=https://chat.example.com bash scripts/e2e.sh
 - [ ] 已验证客户端断开时服务端 LLM 请求被取消（看日志 `client_disconnected`）
 - [ ] 已备份数据库（cron + `sqlite3 .backup`）
 
-## 监控告警
+## 观测（/metrics）
 
-- [ ] 指标：请求 QPS、P50/P95/P99 延迟、流式首 token 延迟、token 用量/用户/天、错误率（按 `error_code` 分）、活跃会话数、SQLite 连接等待数
-- [ ] 告警：5xx 率 > 1%、P95 > 5s、LLM 不可用连续 3 次、磁盘剩余 < 20%、API Key 余额不足
+> **没有首 token 延迟指标就不要做性能优化。** 一切“优化”以
+> `chat_first_token_seconds` 的 P95 变化为唯一裁判：改前抓基线，改后对同口径分位数。
+
+`GET /metrics` 输出 Prometheus text format（纯手写实现，无 prometheus_client
+依赖），指标清单：
+
+| 指标 | 类型 | 说明 |
+|---|---|---|
+| `chat_requests_total` | counter | 对话请求总数（model / error_code / status） |
+| `chat_first_token_seconds` | histogram | 【最关键】首 token 延迟 |
+| `chat_duration_seconds` | histogram | 完整流耗时（p50/p95/p99） |
+| `chat_tokens_total` | counter | token 用量（prompt / completion） |
+| `chat_active_streams` | gauge | 当前活跃流数 |
+| `conversation_messages_total` | counter | 落库消息数（按 role） |
+| `llm_retries_total` | counter | 上游重试次数 |
+| `db_query_seconds` | histogram | DB 查询耗时（按 op） |
+| `locks_contended_total` | counter | 409 会话并发冲突次数 |
+| `context_truncated_total` | counter | 上下文截断次数 |
+
+PromQL 片段与最小面板配置见 `docs/observability.md`；Grafana 面板截图占位：
+
+![Grafana 面板截图占位](docs/assets/grafana-dashboard.png)
+
+压测用 `scripts/load_test.py`（`pip install -r requirements-dev.txt` 后运行）：
+
+```bash
+python scripts/load_test.py --concurrency 50 --duration 600 --url http://localhost:8000
+```
+
+- [ ] 指标：请求 QPS、P50/P95/P99 延迟、流式首 token 延迟、token 用量/用户/天、错误率（按 `error_code` 分）、活跃流数
+- [ ] 告警：5xx 率 > 1%、P95 首 token > 2s、LLM 不可用连续 3 次、磁盘剩余 < 20%、API Key 余额不足
 - [ ] 仪表盘：单图看“请求量 vs 错误率 vs 成本”
 
 ## 回滚
