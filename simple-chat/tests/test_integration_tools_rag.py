@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 from app.llm import client as llm_client
 
 
@@ -105,6 +107,7 @@ def _record_responder(captured):
     return responder
 
 
+@pytest.mark.integration
 async def test_tools_loop_runs_and_persists(client, db, monkeypatch):
     from app.config import settings as s
     monkeypatch.setattr(s, "tools_enabled", True)
@@ -125,6 +128,7 @@ async def test_tools_loop_runs_and_persists(client, db, monkeypatch):
     assert payload["result"]["value"] == 4, payload
 
 
+@pytest.mark.integration
 async def test_rag_context_injected(client, db, monkeypatch, tmp_path):
     from app.config import settings as s
     from app.rag import indexing

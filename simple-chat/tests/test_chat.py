@@ -129,8 +129,13 @@ async def test_nonexistent_conversation(client):
 # ───────────────────────── f. 并发同会话互斥 ─────────────────────────
 
 
-async def test_concurrent_same_conversation(client, db):
-    """同一会话并发第二个请求 → 409 CONVERSATION_BUSY。"""
+async def test_concurrent_same_conversation(client, db, monkeypatch):
+    """同一会话并发第二个请求 → 409 CONVERSATION_BUSY。
+
+    早期实现用固定 sleep(0.1) 赌请求 1 已拿到会话锁，属于时序假设，
+    在并行调度（pytest-xdist）下抖动会偶发假绿。现改为等待
+    _ConversationGate 真正占用锁后再发请求 2，使断言确定化。
+    """
     # 预置一个已知会话，让两个并发请求都指向它
     conv_id = "conv-concurrent"
     now = utcnow_iso()
@@ -143,11 +148,24 @@ async def test_concurrent_same_conversation(client, db):
     # 用阻塞型假客户端：首个 token 前 sleep，期间锁一直被占用
     llm_client._client = make_slow_fake(delay=0.5)
 
+    # 确定性同步：hook 进闸门，待请求 1 真正占用会话锁后再发请求 2
+    import app.chat.service as _svc
+
+    _gate_acquired = asyncio.Event()
+    _orig_enter = _svc._ConversationGate.__aenter__
+
+    async def _wait_acquire(self):
+        lock = await _orig_enter(self)
+        _gate_acquired.set()
+        return lock
+
+    monkeypatch.setattr(_svc._ConversationGate, "__aenter__", _wait_acquire)
+
     task1 = asyncio.create_task(
         collect_stream(client, {"conversation_id": conv_id, "message": "占用"})
     )
-    # 让请求 1 先取得会话锁并进入阻塞
-    await asyncio.sleep(0.1)
+    # 等待请求 1 已持有会话锁（而非依赖固定 sleep 的时序假设）
+    await asyncio.wait_for(_gate_acquired.wait(), timeout=5.0)
 
     # 请求 2 同会话 → 应被判为忙
     res2 = await client.post(

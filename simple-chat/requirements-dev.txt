@@ -5,3 +5,6 @@
 respx>=0.21,<0.22
 # PR-3 改动 4：aiohttp 作为压测客户端与 e2e 原始字节流读取
 aiohttp>=3.9,<3.11
+
+# 测试提速：多进程并行执行（pytest -n auto）。纯测试依赖，不进生产镜像。
+pytest-xdist>=3.6,<4.0

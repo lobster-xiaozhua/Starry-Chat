@@ -180,47 +180,88 @@ def _reset_auth(monkeypatch):
     ratelimit.clear()
 
 
-# ───────────────────────── 数据库路径 ─────────────────────────
+# ---- 数据库路径（会话级，提速） ----
+# 性能优化：ASGI 客户端与 SQLite 在整会话内共享一个临时文件，lifespan 与建表只跑
+# 一次；每个测试通过 _db_conn 舆具在自身连接内截断所有表（等价每测试全新库，
+# 但省去 N x 建表 + N x 临时文件 + N x lifespan 的开销）。隔离是测试正确性的前提。
 
 
-@pytest.fixture
-def db_path(tmp_path):
-    """每测试一个独立 SQLite 文件路径。"""
-    return tmp_path / "chat.db"
+@pytest.fixture(scope="session")
+def db_path(tmp_path_factory):
+    """整会话共用一个 SQLite 文件，避免每个测试重复建表与创建临时文件。"""
+    return tmp_path_factory.mktemp("sess") / "chat.db"
 
 
-# ───────────────────────── 连接夹具 ─────────────────────────
+async def _truncate_tables(conn):
+    """清空所有业务表，保持测试间隔离（等价每测试全新库）。"""
+    for table in (
+        "message",
+        "conversation_memory",
+        "chunk",
+        "conversation",
+        "user",
+        "document",
+        "chunks_fts",
+    ):
+        await conn.execute(f"DELETE FROM {table}")
+    await conn.commit()
 
 
-@pytest_asyncio.fixture
-async def db(db_path, monkeypatch):
-    """每测试一个全新空库（独立连接），避免跨用例污染。"""
-    monkeypatch.setattr(settings, "database_url", f"sqlite+aiosqlite:///{db_path}")
+@pytest.fixture(scope="session", autouse=True)
+def _configure_session_db(db_path):
+    """会话级只建一次表；database_url 指向共享文件，供应用与 db 舆具共用。"""
+    import asyncio
+
     from app.db import init_db
 
-    await init_db()
+    original = settings.database_url
+    settings.database_url = f"sqlite+aiosqlite:///{db_path}"
+    asyncio.run(init_db())
+    yield
+    settings.database_url = original
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _db_conn(db_path):
+    """每个测试一个连接并截断所有表 -> 等价全新空库；db 舆具复用该连接。"""
     import aiosqlite
 
     conn = await aiosqlite.connect(str(db_path))
     conn.row_factory = aiosqlite.Row
     await conn.execute("PRAGMA foreign_keys = ON")
     await conn.execute("PRAGMA journal_mode = WAL")
+    await _truncate_tables(conn)
     try:
         yield conn
     finally:
         await conn.close()
 
 
+@pytest_asyncio.fixture(autouse=True)
+async def _drain_background_tasks():
+    """每个测试结束后排空应用后台任务（标题生成等），避免跨测试/跨循环泄漏。"""
+    yield
+    from app.chat import service as _service
+
+    pending = list(_service._background_tasks)
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    _service._background_tasks.clear()
+
+
 @pytest_asyncio.fixture
-async def client(db_path, monkeypatch):
-    """通过 ASGITransport 直接驱动应用，数据库指向 tmp 文件。"""
+async def db(_db_conn, db_path, monkeypatch):
+    """复用 _db_conn（已截断），返回可用于断言的连接。"""
+    monkeypatch.setattr(settings, "database_url", f"sqlite+aiosqlite:///{db_path}")
+    yield _db_conn
+
+
+@pytest_asyncio.fixture(scope="session")
+async def client(db_path):
+    """会话级 ASGI 客户端：lifespan 与建表只跑一次（提速关键）。"""
     import httpx
 
-    monkeypatch.setattr(settings, "database_url", f"sqlite+aiosqlite:///{db_path}")
-    monkeypatch.setattr(llm_client, "_client", make_default_fake())
-
     from app.main import app
-    from app.chat import service as _service
 
     transport = httpx.ASGITransport(app=app)
     async with app.router.lifespan_context(app):
@@ -228,12 +269,6 @@ async def client(db_path, monkeypatch):
             transport=transport, base_url="http://test"
         ) as ac:
             yield ac
-    # 排空后台标题任务，避免其 aiosqlite 线程在事件循环关闭后才回调
-    pending = list(_service._background_tasks)
-    if pending:
-        await asyncio.gather(*pending, return_exceptions=True)
-    _service._background_tasks.clear()
-
 
 # ───────────────────────── 样本数据夹具 ─────────────────────────
 

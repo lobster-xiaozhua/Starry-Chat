@@ -118,17 +118,29 @@ simple-chat/
 ## 测试
 
 ```bash
-# 安装测试依赖（含覆盖率）
-pip install -r requirements.txt
+# 安装测试依赖（含并行执行插件 pytest-xdist）
+pip install -r requirements-dev.txt
 
-# 运行全部测试并生成覆盖率报告
-pytest -x -v --tb=short --cov=app --cov-report=term-missing
+# 推荐：多进程并行执行（自动按 CPU 数），本地约减半耗时
+pytest -n auto -q
+
+# 最快反馈：仅跑单测，跳过较慢的集成测试
+pytest -m "not integration" -n auto -q
+
+# 仅跑集成/端到端
+pytest -m integration -n auto -q
+
+# 覆盖率报告（可选，会略微拖慢）
+pytest -n auto --cov=app --cov-report=term-missing
 
 # 或用 Makefile
 make test
 ```
 
-测试通过 `ASGITransport` 直接调用应用，并将 LLM 打桩为固定分片，**不需要网络和 API Key**；每个用例使用 `tmp_path` 下的独立 SQLite 文件，不污染 `data/chat.db`。
+测试通过 `ASGITransport` 直接调用应用，并将 LLM 打桩为固定分片，**不需要网络和 API Key**。
+为提速，整测试会话共用一个临时 SQLite 文件（`lifespan` 与建表只跑一次），每个用例在自身连接内
+**截断所有表**以获得与“每用例全新库”等价的隔离，互不污染；应用层状态（LLM 桩、认证开关、
+限流桶、指标）仍由 autouse 夹具逐用例复位。
 
 覆盖率目标：`app/chat/service.py >= 80%`、`app/chat/router.py >= 70%`、`app/llm/client.py >= 60%`。
 
