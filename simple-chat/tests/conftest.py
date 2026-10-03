@@ -163,6 +163,23 @@ def _reset_llm(monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _reset_auth(monkeypatch):
+    """认证相关状态复位：开发默认关认证；固定会话密钥；清空登录限流桶。
+
+    - AUTH_ENABLED=None → 由 app_env(development) 推导为 false，保持既有测试
+      的 X-User-Id 兼容路径不变。
+    - SESSION_SECRET 固定值让 Cookie 伪造/篡改用例可复现；开发环境不强制非空。
+    """
+    monkeypatch.setattr(settings, "auth_enabled", None)
+    monkeypatch.setattr(settings, "session_secret", "test-session-secret-0123456789abcdef")
+    from app.auth import ratelimit
+
+    ratelimit.clear()
+    yield
+    ratelimit.clear()
+
+
 # ───────────────────────── 数据库路径 ─────────────────────────
 
 

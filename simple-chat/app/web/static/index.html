@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src * data:; connect-src 'self'" />
 <meta name="llm-model" content="" />
+<meta name="auth-enabled" content="" />
 <title>Simple Chat</title>
 <!-- Markdown 渲染依赖：改为本地 vendor（断网可用 + SRI 完整性校验），不再依赖外部 CDN。
      XSS 防护三层（改动 2）：A. vendor 进仓库 + SRI；B. 上方 CSP meta；C. app.js 的
@@ -535,6 +536,91 @@
     z-index: 15;
   }
   .scrim.show { display: block; }
+
+  /* ───────────────── 登录 / 注册（v0.2 认证） ───────────────── */
+  #auth-gate {
+    position: fixed; inset: 0;
+    background: var(--bg);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: 30;
+    padding: 20px;
+  }
+  #auth-gate.show { display: flex; }
+  #auth-gate .auth-card {
+    width: 100%;
+    max-width: 360px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-bubble);
+    box-shadow: var(--shadow-md);
+    padding: 24px 22px;
+  }
+  #auth-gate h1 { margin: 0 0 4px; font-size: 20px; }
+  #auth-gate .auth-sub { margin: 0 0 18px; color: var(--text-muted); font-size: 13px; }
+  #auth-gate label { display: block; font-size: 13px; color: var(--text-muted); margin: 10px 0 4px; }
+  #auth-gate input {
+    width: 100%;
+    padding: 10px 12px;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-control);
+    font: inherit;
+    color: var(--text);
+    background: var(--surface);
+  }
+  #auth-gate input:focus { border-color: var(--primary); outline: none; box-shadow: var(--ring); }
+  #auth-gate .auth-submit {
+    width: 100%;
+    margin-top: 16px;
+    padding: 11px 12px;
+    border: none;
+    border-radius: var(--radius-control);
+    background: var(--primary);
+    color: var(--on-primary);
+    font-weight: 600;
+    cursor: pointer;
+  }
+  #auth-gate .auth-submit:hover:not(:disabled) { background: var(--primary-hover); }
+  #auth-gate .auth-submit:disabled { background: var(--border-strong); cursor: not-allowed; }
+  #auth-gate .auth-switch {
+    margin-top: 12px;
+    font-size: 13px;
+    color: var(--text-muted);
+    text-align: center;
+  }
+  #auth-gate .auth-switch button {
+    border: none; background: none; color: var(--primary);
+    cursor: pointer; font: inherit; text-decoration: underline; padding: 0 2px;
+  }
+  #auth-error {
+    margin-top: 10px;
+    color: var(--danger);
+    font-size: 13px;
+    min-height: 18px;
+  }
+  #user-chip {
+    display: none;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--text-muted);
+    max-width: 130px;
+  }
+  #user-chip.show { display: flex; }
+  #user-chip .name {
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  #btn-logout {
+    padding: 6px 10px;
+    border: 1px solid var(--border-strong);
+    background: var(--surface);
+    color: var(--text-muted);
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 12px;
+  }
+  #btn-logout:hover { color: var(--danger); border-color: var(--danger); }
 </style>
 </head>
 <body>
@@ -550,6 +636,10 @@
       <div id="model-name">
         <span class="dot" aria-hidden="true"></span>
         <span class="label" id="model-label">加载中…</span>
+      </div>
+      <div id="user-chip" aria-label="当前用户">
+        <span class="name" id="user-name"></span>
+        <button id="btn-logout" type="button" aria-label="退出登录">退出</button>
       </div>
       <button id="btn-clear" aria-label="清空所有会话">清空</button>
     </div>
@@ -586,6 +676,25 @@
       <div class="composer-hint" id="composer-hint">Enter 发送 · Shift+Enter 换行</div>
     </footer>
   </main>
+
+  <div id="auth-gate" role="dialog" aria-modal="true" aria-labelledby="auth-title">
+    <form class="auth-card" id="auth-form" autocomplete="on">
+      <h1 id="auth-title">登录</h1>
+      <p class="auth-sub" id="auth-sub">登录后查看你的会话</p>
+      <label for="auth-username">用户名</label>
+      <input id="auth-username" name="username" type="text" autocomplete="username"
+             required minlength="3" maxlength="64" />
+      <label for="auth-password">密码</label>
+      <input id="auth-password" name="password" type="password" autocomplete="current-password"
+             required minlength="8" maxlength="128" />
+      <div id="auth-error" role="alert"></div>
+      <button class="auth-submit" id="auth-submit" type="submit">登录</button>
+      <div class="auth-switch">
+        <span id="auth-switch-text">没有账号？</span>
+        <button type="button" id="auth-switch-btn">注册</button>
+      </div>
+    </form>
+  </div>
 
   <script type="module" src="/static/app.js"></script>
 </body>

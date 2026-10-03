@@ -15,18 +15,26 @@
 // - 用户输入永远先 escape 再拼接到 DOM；markdown 只用于 assistant 最终态。
 
 const API_BASE = "/api/chat";
+const AUTH_BASE = "/api/auth";
+
+// v0.2 认证：默认关闭，由服务端注入的 <meta name="auth-enabled"> 决定。
+// 认证关闭时前端完全保持 v0.1 行为（无登录门、无 X-User-Id 头）。
+const AUTH_ENABLED =
+  (document.querySelector('meta[name="auth-enabled"]')?.content || "false") === "true";
 
 // 错误码 → 面向用户文案（改动 3）。后端 SSE/HTTP 错误体恒为 {"code","message"}，
 // 优先用后端 message（已含具体信息，如“请求参数错误：xxx”）；message 缺失时回退到本表。
 const ERRORS = {
   VALIDATION_ERROR: "请求参数错误",
   AUTH_ERROR: "服务认证失败",
+  UNAUTHORIZED: "登录状态已失效，请重新登录",
   MODEL_UNAVAILABLE: "模型不存在",
   CONTEXT_OVERFLOW: "对话过长，已自动精简历史",
   RATE_LIMITED: "请求过于频繁，请稍候",
   CONVERSATION_BUSY: "该会话正在生成回复，请稍候",
   INTERNAL_ERROR: "服务内部错误，请稍后重试",
   NOT_FOUND: "资源不存在",
+  CONFLICT: "资源冲突",
 };
 
 function errText(payload) {
@@ -52,6 +60,19 @@ const btnNew = $("btn-new");
 const btnClear = $("btn-clear");
 const sidebarToggle = $("sidebar-toggle");
 const scrim = $("scrim");
+const authGate = $("auth-gate");
+const authForm = $("auth-form");
+const authTitle = $("auth-title");
+const authSub = $("auth-sub");
+const authUsername = $("auth-username");
+const authPassword = $("auth-password");
+const authError = $("auth-error");
+const authSubmit = $("auth-submit");
+const authSwitchText = $("auth-switch-text");
+const authSwitchBtn = $("auth-switch-btn");
+const userChip = $("user-chip");
+const userName = $("user-name");
+const btnLogout = $("btn-logout");
 
 // ───────────────────────── 运行时状态 ─────────────────────────
 const state = {
@@ -59,6 +80,8 @@ const state = {
   sending: false,                  // 流式进行中？
   conversations: [],               // 侧边栏缓存
   modelName: "",
+  username: "",                    // v0.2 登录用户名（仅展示）
+  authMode: "login",               // v0.2 认证门当前模式
   lastUserText: "",                // 用于“重试”
   lastAssistantEl: null,           // 当前流式写入的 assistant 气泡
   controller: null,                // AbortController
@@ -202,8 +225,135 @@ async function readErrorBody(res) {
   }
 }
 
+// ───────────────────────── 认证（v0.2） ─────────────────────────
+// 认证开启时：启动先 GET /api/auth/me 探测登录态；未登录显示门。
+// 会话 Cookie 由服务端 HttpOnly 下发，前端不接触令牌。
+function showAuthGate() {
+  clearStream();
+  renderSidebar();
+  authGate.classList.add("show");
+  authError.textContent = "";
+  authPassword.value = "";
+  inputEl.disabled = true;
+  setTimeout(() => authUsername.focus(), 0);
+}
+
+function hideAuthGate() {
+  authGate.classList.remove("show");
+  inputEl.disabled = false;
+  inputEl.focus();
+}
+
+function setAuthMode(mode) {
+  // mode: "login" | "register"
+  state.authMode = mode;
+  const isLogin = mode === "login";
+  authTitle.textContent = isLogin ? "登录" : "注册";
+  authSub.textContent = isLogin ? "登录后查看你的会话" : "创建一个本地账号";
+  authSubmit.textContent = isLogin ? "登录" : "注册";
+  authSwitchText.textContent = isLogin ? "没有账号？" : "已有账号？";
+  authSwitchBtn.textContent = isLogin ? "注册" : "登录";
+  authPassword.setAttribute("autocomplete", isLogin ? "current-password" : "new-password");
+  authError.textContent = "";
+}
+
+function setCurrentUser(username) {
+  state.username = username || "";
+  if (state.username) {
+    userName.textContent = state.username;
+    userChip.classList.add("show");
+  } else {
+    userChip.classList.remove("show");
+  }
+}
+
+async function submitAuth() {
+  const username = authUsername.value.trim();
+  const password = authPassword.value;
+  if (!username || !password) {
+    authError.textContent = "请输入用户名和密码";
+    return;
+  }
+  authSubmit.disabled = true;
+  authError.textContent = "";
+  try {
+    const res = await fetch(`${AUTH_BASE}/${state.authMode}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password }),
+    });
+    if (!res.ok) {
+      const err = await readErrorBody(res);
+      authError.textContent = err.message || "认证失败";
+      return;
+    }
+    const data = await res.json().catch(() => ({}));
+    setCurrentUser(data?.user?.username || username);
+    hideAuthGate();
+    await refreshSidebar();
+  } catch {
+    authError.textContent = "网络错误，请重试";
+  } finally {
+    authSubmit.disabled = false;
+  }
+}
+
+async function logout() {
+  try {
+    await fetch(`${AUTH_BASE}/logout`, { method: "POST" });
+  } catch { /* 忽略网络错误：本地状态仍要清干净 */ }
+  setCurrentUser("");
+  state.conversationId = null;
+  state.conversations = [];
+  renderEmptyApp();
+  renderSidebar();
+  setAuthMode("login");
+  showAuthGate();
+}
+
+// 处理 401：切换回登录门
+function handleUnauthorized(message) {
+  finalizeAbortedAssistant?.();
+  setCurrentUser("");
+  showAuthGate();
+  setAuthMode("login");
+  authError.textContent = message || "登录状态已失效，请重新登录";
+}
+
+async function restoreSession() {
+  try {
+    const res = await fetch(`${AUTH_BASE}/me`, { headers: { Accept: "application/json" } });
+    if (res.status === 401) {
+      showAuthGate();
+      return false;
+    }
+    if (!res.ok) {
+      showAuthGate();
+      return false;
+    }
+    const data = await res.json().catch(() => ({}));
+    setCurrentUser(data?.user?.username || "");
+    hideAuthGate();
+    return true;
+  } catch {
+    showAuthGate();
+    authError.textContent = "无法连接服务，请稍后重试";
+    return false;
+  }
+}
+
+authForm.addEventListener("submit", (e) => {
+  e.preventDefault();
+  submitAuth();
+});
+authSwitchBtn.addEventListener("click", () => {
+  setAuthMode(state.authMode === "login" ? "register" : "login");
+});
+btnLogout.addEventListener("click", logout);
+
 async function loadConversations() {
   const res = await fetch(`${API_BASE}/conversations`, { headers: { Accept: "application/json" } });
+  if (res.status === 401) return handleUnauthorized();
   if (res.status === 204) return [];
   const data = await res.json();
   if (!res.ok) throw new Error(data?.error?.message || `HTTP ${res.status}`);
@@ -212,6 +362,7 @@ async function loadConversations() {
 
 async function loadMessages(conversationId) {
   const res = await fetch(`${API_BASE}/conversations/${conversationId}/messages`);
+  if (res.status === 401) return handleUnauthorized();
   const data = await res.json();
   if (!res.ok) throw new Error(data?.error?.message || `HTTP ${res.status}`);
   return data.messages || [];
@@ -219,6 +370,7 @@ async function loadMessages(conversationId) {
 
 async function deleteConversation(id) {
   const res = await fetch(`${API_BASE}/conversations/${id}`, { method: "DELETE" });
+  if (res.status === 401) return handleUnauthorized();
   if (res.status === 204) return;
   // 有错误体则解析
   const data = await res.json().catch(() => null);
@@ -240,6 +392,12 @@ async function sendMessage(conversationId, message, { signal } = {}) {
     signal,
   });
   if (!res.ok) {
+    if (res.status === 401) {
+      handleUnauthorized();
+      const err = { code: "UNAUTHORIZED", message: "登录状态已失效，请重新登录" };
+      const e = new Error(err.message); e.code = err.code; e.httpStatus = 401;
+      throw e;
+    }
     const err = await readErrorBody(res);
     const e = new Error(err.message); e.code = err.code; e.httpStatus = res.status;
     throw e;
@@ -750,9 +908,17 @@ async function boot() {
   loadModelName();
   bindSidebarPref();
   renderEmptyApp();
-  await refreshSidebar();
-  loadSidebarPref();
-  inputEl.focus();
+  if (AUTH_ENABLED) {
+    setAuthMode("login");
+    const loggedIn = await restoreSession();
+    if (loggedIn) await refreshSidebar();
+    else showAuthGate();
+  } else {
+    // 认证关闭：保持 v0.1 兼容行为（无登录门）
+    await refreshSidebar();
+    loadSidebarPref();
+    inputEl.focus();
+  }
 }
 
 boot();

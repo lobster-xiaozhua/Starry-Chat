@@ -17,6 +17,8 @@ from app.chat import service
 from app.db import utcnow_iso
 from app.deps import DbDep, UserIdDep
 from app.errors import AppError, ErrorCode
+from app.budget import enforce_budget
+from app.routing import select_model
 from app.schema import (
     ChatRequest,
     ChatResponse,
@@ -149,6 +151,19 @@ async def chat(body: ChatRequest, conn: DbDep, user_id: UserIdDep, request: Requ
     # 发出后即关闭它；StreamingResponse 的 body_iterator 是在响应头之后才跑的，
     # 那时 conn 已不可用。预检通过后，剩下的流式落库由 _stream_response 自管的
     # 连接负责（见 CODEBUDDY.md “流式连接 gotcha”）。
+    #
+    # v0.3 多模型路由：在调用 service 前完成路由选择与预算检查。
+    # - 预算护栏需访问 DB（按用户当日 SUM(tokens)），必须在 conn 仍可用时执行；
+    #   超额抛 RateLimitedError（429）。
+    # - 路由为纯规则，不调用模型；选中 model 写入 body.model，service 据此透传。
+    if body.model:
+        # 显式 model：经 select_model 校验白名单（路由关闭时白名单退化为 [LLM_MODEL]）
+        body.model = select_model(
+            (body.message or "").strip(), explicit_model=body.model
+        )
+    else:
+        body.model = select_model((body.message or "").strip())
+    await enforce_budget(conn, user_id)
     gen = await service.send_message(body, conn, user_id)
     request_id = getattr(request.state, "request_id", None)
     if body.stream:

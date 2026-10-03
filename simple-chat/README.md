@@ -66,6 +66,12 @@ simple-chat/
 │   ├── chat/              # 对话领域
 │   │   ├── service.py     # 会话/消息读写、上下文裁剪、标题生成
 │   │   └── router.py      # /api/chat 路由与 SSE 生成器
+│   ├── auth/              # v0.2 认证：本地账号 + 签名 Cookie
+│   │   ├── service.py     # 注册/登录业务（scrypt 哈希、统一失败响应）
+│   │   ├── session.py     # HMAC 签名会话令牌与 Cookie 属性
+│   │   ├── passwords.py   # hashlib.scrypt 哈希/校验
+│   │   ├── ratelimit.py   # 登录/注册独立限流桶
+│   │   └── router.py      # /api/auth/* 路由
 │   ├── llm/
 │   │   ├── client.py      # OpenAI 异步封装与异常映射
 │   │   └── tokenizer.py   # tiktoken 估算（不可用时退化为字符近似）
@@ -97,6 +103,15 @@ simple-chat/
 | `TRUSTED_PROXIES` | `[]` | 受信反向代理 IP 列表；**仅当非空**时才采信 `X-Forwarded-For` 取真实客户端 IP（防伪造 XFF 绕过限流） |
 | `WORKERS` | 由 CPU 核心数推导 | 生产 uvicorn worker 数；不设置则取 CPU 核心数 |
 | `MAX_BODY_BYTES` | `1048576` | 请求体大小上限（1MB），超出返回 413 |
+| `AUTH_ENABLED` | 由环境推导 | v0.2 认证开关；不设置时：生产=开、开发=关。关闭时保留 `X-User-Id` 兼容路径 |
+| `SESSION_SECRET` | 空 | 会话 Cookie 的 HMAC 签名密钥；**生产 + 认证开启时强制 >= 32 字符**，否则启动失败。轮换即全员登出 |
+| `SESSION_TTL_SECONDS` | `604800` | 会话有效期（7 天） |
+| `SESSION_COOKIE_NAME` | `sc_session` | 会话 Cookie 名 |
+| `SESSION_COOKIE_SECURE` | 由环境推导 | Cookie `Secure` 属性；不设置时生产=开（需 HTTPS），纯 HTTP 部署显式设 `false` |
+| `AUTH_RATE_LIMIT_ENABLED` | `true` | 登录/注册独立限流桶开关 |
+| `AUTH_RATE_LIMIT_MAX` | `10` | 登录/注册窗口内失败次数上限，超出 429 |
+| `AUTH_RATE_LIMIT_WINDOW_SECONDS` | `60` | 认证限流窗口（秒） |
+| `SCRYPT_N` / `SCRYPT_R` / `SCRYPT_P` | `16384` / `8` / `1` | 密码哈希成本参数（标准库 `hashlib.scrypt`；N 必须为 2 的幂） |
 
 > 说明：`RATE_LIMIT_ENABLED` / `WORKERS` 留空时按运行环境自动推导，无需手动设置；仅在需要覆盖默认行为时才显式赋值。
 
@@ -117,11 +132,26 @@ make test
 
 覆盖率目标：`app/chat/service.py >= 80%`、`app/chat/router.py >= 70%`、`app/llm/client.py >= 60%`。
 
-## 已知边界（MVP 有意不做）
+## 已知边界与演进路线
 
-不做：完整认证 / OAuth、精确 token 计费、迁移框架、工具调用、RAG、长期记忆、多模型路由、多进程共享状态（见下文限流与并发说明）。
+本服务按 `docs/ROADMAP.md` 的版本格递进式扩展能力。每个新能力默认关闭（`*_ENABLED` 配置开关），回滚 = 关开关。当前已落地的能力格：
 
-已具备的生产就绪能力（本仓库后续补充）：结构化 JSON 日志、健康检查、内存限流（单实例）、客户端断连取消、配置分层、请求体大小限制、会话归属校验、XSS 防护（DOMPurify）。
+- **v0.2 多用户与认证**：本地账号 + scrypt + 签名 HttpOnly Cookie；`AUTH_ENABLED`。
+- **v0.3 多模型路由**：纯规则路由（不调用模型做路由）+ fallback + 每用户日 token 预算；`ROUTING_ENABLED` / `BUDGET_ENABLED`。
+- **v0.4 工作记忆**：每 N 轮摘要（禁向量数据库，摘要只压缩滑出窗口的旧消息）；`MEMORY_ENABLED`。
+- **v0.5 工具调用**：`calculate` / `read_file` / `web_search` 三工具，沙盒执行（CPU 1s / 内存 128MB / 禁网）；`TOOLS_ENABLED`（子系统已就绪，主聊天流集成进行中）。
+- **v0.6 RAG**：SQLite FTS5 + BM25 检索（禁向量数据库）；`RAG_ENABLED`（子系统已就绪，主聊天流集成进行中）。
+
+后续版本格（v0.7 Agent / v0.8 多模态）见 `docs/ROADMAP.md`。仍有意不做：OAuth/SSO/RBAC、JWT refresh、向量数据库（v0.6 前）、`eval`/`exec` 实现工具、用生成器+长轮询承载 Agent、Kafka/Redis/RabbitMQ、用大模型做路由。
+
+## 认证（v0.2）
+
+- 端点：`POST /api/auth/register`、`POST /api/auth/login`、`POST /api/auth/logout`、`GET /api/auth/me`。
+- 口令：标准库 `hashlib.scrypt` + 每用户随机 salt，只存哈希；响应体与日志绝不包含 `password_hash` 或明文密码。
+- 会话：HMAC-SHA256 签名 Cookie（无 session 表），`HttpOnly; SameSite=Strict; Path=/`，生产自动加 `Secure`。
+- 隔离：认证开启时 chat / conversation 一律按 Cookie 中的已验证 user_id 归属；未登录或被篡改 → 401 `UNAUTHORIZED`；访问他人会话统一 404（不泄露存在性）。
+- 防爆破：登录/注册失败按 IP + 用户名进独立滑动窗口桶（默认 10 次/60s），超限 429；失败文案统一，且未知用户也执行一次 scrypt，避免账号枚举与时序探测。
+- 兼容路径：`AUTH_ENABLED=false` 时保留 v0.1 的 `X-User-Id` 头；生产默认开启认证。
 ---
 
 # 生产部署
@@ -276,6 +306,10 @@ K8s 示例：
 | 用户输入进 SQL 必须参数化 | 已完成 | 全部 SQL 均用 ? 占位符，无 f-string 拼 SQL |
 | XSS：前端 innerHTML 前转义 / DOMPurify | 已完成 | 用户输入走 textContent；Markdown 经 DOMPurify.sanitize（app/web/static/app.js） |
 | 会话归属校验（user_id 匹配）防 ID 遍历 | 已完成 | 会话绑定 user_id，非本人访问统一 404 |
+| 用户口令只存慢哈希 | 已完成 | v0.2：`hashlib.scrypt`（随机 salt，参数见 `SCRYPT_*`）；密码不落明文、不进日志 |
+| 会话 Cookie 防伪造 / XSS 窃取 | 已完成 | HMAC-SHA256 签名 + 常量时间验签；`HttpOnly; SameSite=Strict; Secure`（生产） |
+| 登录防爆破 | 已完成 | v0.2：IP + 用户名独立限流桶（默认 10 次/60s → 429），统一失败响应 |
+| 会话密钥生产强制非空 | 已完成 | 生产 + 认证开启时 `SESSION_SECRET` < 32 字符会在启动期直接报错 |
 | 请求体大小限制（1MB） | 已完成 | BodySizeLimitMiddleware + Nginx client_max_body_size 双保险 |
 | 依赖漏洞扫描 | 已完成 | make audit（pip-audit） |
 | 结构化日志不泄露密钥 / 全文 | 已完成 | API Key 显示为 sk-***<后4位>，Authorization 置 ***；从不记录 message.content |
@@ -283,7 +317,8 @@ K8s 示例：
 | 反向代理关闭缓冲 | 需运维 | 见上文 Nginx 配置 |
 | 多实例限流 / 并发锁一致性 | 需评估 | 当前为单实例内存实现；多副本需换 Redis+Lua / 外部锁 |
 
-注：认证（登录 / JWT）仍是 stub（仅 X-User-Id 头），属已知边界；上线前务必补齐真实鉴权，否则 user_id 可被客户端伪造、归属校验形同虚设。
+注：v0.2 起本地账号认证已落地（scrypt 密码哈希 + 签名 HttpOnly Cookie）；`AUTH_ENABLED=false`
+仅用于回滚到 `X-User-Id` 兼容路径，该路径下 user_id 仍可被客户端伪造，生产环境请保持认证开启。
 
 # 发布
 
@@ -302,6 +337,15 @@ BASE=https://chat.example.com bash scripts/e2e.sh
 ```
 
 验收覆盖健康检查、流式 SSE、SSE `done` 事件中的会话 ID、多轮对话、会话列表与删除、生产限流（第 31 次起返回 429）以及空消息 422。限流步骤使用 `X-Forwarded-For` 与 `X-User-Id` 隔离测试流量；请仅在受控的验收环境运行。
+
+认证链路验收（服务需以 `AUTH_ENABLED=true` 启动）：
+
+```bash
+bash scripts/e2e_auth.sh
+```
+
+覆盖注册/登录/登出、Cookie 属性（HttpOnly + SameSite=Strict）、伪造 Cookie 401、
+A/B 会话隔离（B 访问 A 的会话返回 404）与登录失败限流 429。
 
 ## 成本模型
 

@@ -11,6 +11,9 @@ from app.config import settings
 async def test_rate_limit_whitelist_only_in_dev(client, monkeypatch):
     monkeypatch.setattr(settings, "app_env", "production")
     monkeypatch.setattr(settings, "rate_limit_enabled", None)  # 生产默认开
+    # v0.2：生产默认同时开启认证（AUTH_ENABLED 未配置 → 生产推导为 true）。
+    # 本用例只验证限流行为，显式关闭认证，避免 401 混入状态码断言。
+    monkeypatch.setattr(settings, "auth_enabled", False)
     assert settings.effective_rate_limit is True
 
     statuses = []

@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import random
 import time
@@ -251,15 +252,51 @@ async def _close_upstream(stream: Any) -> None:
 # ───────────────────────── 对外函数 ─────────────────────────
 
 
+async def _iter_stream(stream: Any) -> AsyncGenerator[str, None]:
+    """逐 chunk 产出 token 文本；空 delta 跳过。
+
+    不做重试、不做错误映射——把原始 openai 异常上抛给 chat_stream 统一处理，
+    避免 fallback 与重试逻辑纠缠。chunk.choices 为空（如 OpenAI 偶发的 usage
+    chunk）直接跳过。
+    """
+    async for chunk in stream:
+        if not chunk.choices:
+            continue
+        delta = chunk.choices[0].delta
+        text = delta.content if delta and delta.content else ""
+        if text:
+            yield text
+
+
+def _pick_fallback(primary: str) -> str | None:
+    """选择首个与 primary 不同且在白名单内的 fallback 模型；无则 None。
+
+    v0.3 约束：最多降级一次，故只取列表中第一个可用候选，不级联多级 fallback。
+    路由关闭时 settings.effective_fallback_models 已为空，此处直接返回 None。
+    """
+    for m in settings.effective_fallback_models:
+        if m != primary and m in settings.effective_model_whitelist:
+            return m
+    return None
+
+
 async def chat_stream(
     messages: list[dict],
     model: str | None = None,
     temperature: float | None = None,
     max_tokens: int | None = None,
+    *,
+    tools: list[dict] | None = None,
+    tool_choice: str | dict | None = None,
 ) -> AsyncGenerator[str, None]:
     """流式对话：逐 token 产出文本片段。
 
-    重试仅作用于首个响应；一旦开始产出 token，中途错误不重试，直接抛业务异常。
+    重试仅作用于首个响应（建立连接阶段，由 _attempt_with_retry 处理 429/5xx/
+    超时）；一旦开始产出 token，中途错误不再重试——已发出的内容无法撤回。
+
+    v0.3 fallback：仅当尚未产出 token 时降级一次（primary → 首个可用 fallback）。
+    已产出 token 后报错不切换、不重试。fallback 候选由 _pick_fallback 决定，
+    路由关闭或无可用 fallback 时不降级。
     """
     mdl = model or settings.llm_model
     temp = temperature if temperature is not None else settings.llm_temperature
@@ -267,54 +304,101 @@ async def chat_stream(
     full = _ensure_system_prompt(messages)
     t0 = time.monotonic()
     produced = 0
+    fallback = _pick_fallback(mdl)
 
-    def factory():
-        return _get_client().chat.completions.create(
-            model=mdl,
-            messages=full,
-            max_tokens=mtok,
-            temperature=temp,
-            stream=True,
-        )
+    def factory(m: str):
+        kwargs: dict = {
+            "model": m,
+            "messages": full,
+            "max_tokens": mtok,
+            "temperature": temp,
+            "stream": True,
+        }
+        if tools is not None:
+            kwargs["tools"] = tools
+        if tool_choice is not None:
+            kwargs["tool_choice"] = tool_choice
+        return _get_client().chat.completions.create(**kwargs)
 
-    stream = await _attempt_with_retry(factory, model=mdl)
+    current = mdl
+    stream: Any = None
     cancelled = False
     try:
-        async for chunk in stream:
-            if not chunk.choices:
-                continue
-            delta = chunk.choices[0].delta
-            text = delta.content if delta and delta.content else ""
-            if text:
+        try:
+            stream = await _attempt_with_retry(functools.partial(factory, current), model=current)
+        except AppError as exc:
+            # 建立连接阶段失败且未产出 token：尝试一次 fallback。
+            _log_call(current, t0, 0, stream=True, code=exc.code.value)
+            if fallback is not None:
+                current = fallback
+                stream = await _attempt_with_retry(
+                    functools.partial(factory, current), model=current
+                )
+            else:
+                raise
+
+        try:
+            async for text in _iter_stream(stream):
                 produced += count_tokens(text)
                 yield text
-    except asyncio.CancelledError:
-        # 客户端断开 / 请求被取消：释放上游连接与计费，避免悬挂的 token 计费。
-        cancelled = True
-        await _close_upstream(stream)
-        logger.info(
-            "llm_stream_cancelled",
-            extra={"model": mdl, "tokens_out": produced, "event": "llm_stream_cancelled"},
-        )
-        raise
-    except AppError as exc:
-        _log_call(mdl, t0, produced, stream=True, code=exc.code.value)
-        raise
-    except Exception as exc:
-        # 流中途（连接已建立后）超时：重试已不可能——按内部错误处理，
-        # 前端收到 INTERNAL_ERROR 后展示可重试按钮（PR-3 T5 契约）。
-        # 建立连接阶段的超时仍走 _attempt_with_retry → map_openai_error → RATE_LIMITED。
-        if isinstance(exc, (httpx.TimeoutException, openai.APITimeoutError)):
-            mapped = AppError(ErrorCode.INTERNAL_ERROR, "模型响应超时，请重试")
-        else:
-            mapped = map_openai_error(exc)
-        _log_call(mdl, t0, produced, stream=True, code=mapped.code.value)
-        raise mapped from exc
+        except asyncio.CancelledError:
+            cancelled = True
+            await _close_upstream(stream)
+            logger.info(
+                "llm_stream_cancelled",
+                extra={"model": current, "tokens_out": produced, "event": "llm_stream_cancelled"},
+            )
+            raise
+        except AppError as exc:
+            # 流中途（已建立连接后）业务异常：未产出 token 且有 fallback → 降级一次。
+            if produced == 0 and fallback is not None and current == mdl:
+                _log_call(current, t0, 0, stream=True, code=exc.code.value)
+                await _close_upstream(stream)
+                current = fallback
+                stream = await _attempt_with_retry(
+                    functools.partial(factory, current), model=current
+                )
+                async for text in _iter_stream(stream):
+                    produced += count_tokens(text)
+                    yield text
+            else:
+                _log_call(current, t0, produced, stream=True, code=exc.code.value)
+                raise
+        except Exception as exc:
+            # 流中途非业务异常：未产出 token 且有 fallback → 降级一次。
+            if produced == 0 and fallback is not None and current == mdl:
+                mapped_pre = map_openai_error(exc)
+                _log_call(current, t0, 0, stream=True, code=mapped_pre.code.value)
+                await _close_upstream(stream)
+                current = fallback
+                try:
+                    stream = await _attempt_with_retry(
+                        functools.partial(factory, current), model=current
+                    )
+                    async for text in _iter_stream(stream):
+                        produced += count_tokens(text)
+                        yield text
+                except AppError as exc2:
+                    _log_call(current, t0, produced, stream=True, code=exc2.code.value)
+                    raise
+                except Exception as exc2:
+                    mapped2 = map_openai_error(exc2)
+                    _log_call(current, t0, produced, stream=True, code=mapped2.code.value)
+                    raise mapped2 from exc2
+            else:
+                # 流中途（连接已建立后）超时：重试已不可能——按内部错误处理，
+                # 前端收到 INTERNAL_ERROR 后展示可重试按钮（PR-3 T5 契约）。
+                if isinstance(exc, (httpx.TimeoutException, openai.APITimeoutError)):
+                    mapped = AppError(ErrorCode.INTERNAL_ERROR, "模型响应超时，请重试")
+                else:
+                    mapped = map_openai_error(exc)
+                _log_call(current, t0, produced, stream=True, code=mapped.code.value)
+                raise mapped from exc
     finally:
         # 非取消路径：确保上游流被关闭，释放连接回连接池
-        if not cancelled:
+        if not cancelled and stream is not None:
             await _close_upstream(stream)
-    _log_call(mdl, t0, produced, stream=True)
+    _log_call(current, t0, produced, stream=True)
 
 
 async def chat(
@@ -367,6 +451,94 @@ async def chat(
         "usage": usage,
         "model": mdl,
         "finish_reason": resp.choices[0].finish_reason if resp.choices else None,
+    }
+
+
+async def chat_with_tools(
+    messages: list[dict],
+    tools: list[dict],
+    model: str | None = None,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+    tool_choice: str | dict | None = "auto",
+) -> dict:
+    """非流式对话（含工具）：返回完整响应与解析后的 tool_calls。
+
+    仅用于 v0.5 工具循环中的「推理轮」：模型可能在 content 之外返回
+    tool_calls；调用方据此执行工具并把结果回灌，再进入下一轮或最终文本轮。
+
+    返回结构（对齐 OpenAI 工具调用）：
+        {
+          "content": str,                       # 可能为空（纯工具轮）
+          "tool_calls": [
+             {"id": str, "name": str, "arguments": dict},
+             ...
+          ],
+          "usage": {...}, "model": str, "finish_reason": str | None,
+        }
+
+    tool_calls 的 arguments 已尝试 JSON 解析为 dict（解析失败则原样保留字符串）。
+    """
+    import json as _json
+
+    mdl = model or settings.llm_model
+    temp = temperature if temperature is not None else settings.llm_temperature
+    mtok = max_tokens if max_tokens is not None else settings.llm_max_tokens
+    full = _ensure_system_prompt(messages)
+    t0 = time.monotonic()
+
+    def factory():
+        return _get_client().chat.completions.create(
+            model=mdl,
+            messages=full,
+            max_tokens=mtok,
+            temperature=temp,
+            stream=False,
+            tools=tools,
+            tool_choice=tool_choice,
+        )
+
+    try:
+        resp = await _attempt_with_retry(factory, model=mdl)
+    except AppError as exc:
+        _log_call(mdl, t0, 0, stream=False, code=exc.code.value)
+        raise
+
+    msg = resp.choices[0].message if resp.choices else None
+    content = (getattr(msg, "content", None) or "") if msg else ""
+    raw_tool_calls = getattr(msg, "tool_calls", None) or [] if msg else []
+    tool_calls: list[dict] = []
+    for tc in raw_tool_calls:
+        fn = getattr(tc, "function", None)
+        if fn is None:
+            continue
+        args = getattr(fn, "arguments", None) or "{}"
+        try:
+            parsed_args: Any = _json.loads(args) if isinstance(args, str) else args
+        except (_json.JSONDecodeError, TypeError):
+            parsed_args = args
+        tool_calls.append(
+            {
+                "id": getattr(tc, "id", ""),
+                "name": getattr(fn, "name", ""),
+                "arguments": parsed_args,
+            }
+        )
+
+    raw_usage = getattr(resp, "usage", None)
+    usage = {
+        "prompt_tokens": getattr(raw_usage, "prompt_tokens", estimate_tokens(full)) or estimate_tokens(full),
+        "completion_tokens": getattr(raw_usage, "completion_tokens", 0) or 0,
+        "total_tokens": getattr(raw_usage, "total_tokens", None)
+        or (estimate_tokens(full) + 0),
+    }
+    _log_call(mdl, t0, usage["completion_tokens"], stream=False, tokens_in=usage["prompt_tokens"])
+    return {
+        "content": content,
+        "tool_calls": tool_calls,
+        "usage": usage,
+        "model": mdl,
+        "finish_reason": (resp.choices[0].finish_reason if resp.choices else None),
     }
 
 
@@ -426,6 +598,7 @@ __all__ = [
     "map_openai_error",
     "chat_stream",
     "chat",
+    "chat_with_tools",
     "set_client",
     "reset_client",
     "ping",

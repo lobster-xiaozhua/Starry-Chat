@@ -13,7 +13,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-Role = Literal["user", "assistant", "system"]
+Role = Literal["user", "assistant", "system", "tool"]
 
 
 # ───────────────────────── 请求 ─────────────────────────
@@ -66,6 +66,10 @@ class MessageDTO(BaseModel):
     content: str
     tokens: int
     created_at: str
+    # v0.5 工具：role='tool' 消息带 tool_call_id；assistant 消息可能携带 tool_calls_json。
+    # 均为可空，旧消息与纯文本消息留 None，向后兼容。
+    tool_call_id: str | None = None
+    tool_calls_json: str | None = None
 
 
 class ConversationDTO(BaseModel):
@@ -135,6 +139,38 @@ class ErrorEvent(BaseModel):
     message: str
 
 
+# ───────────────────────── v0.2 认证 ─────────────────────────
+
+
+class AuthCredentials(BaseModel):
+    """注册 / 登录请求体；用户名与密码长度在服务端再次校验。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    username: str = Field(..., min_length=1, max_length=64, description="用户名")
+    password: str = Field(..., min_length=1, max_length=128, description="密码（明文传输依赖 HTTPS）")
+
+
+class AuthUser(BaseModel):
+    """对外用户视图；绝不包含 password_hash。"""
+
+    id: str
+    username: str
+    created_at: str | None = None
+
+
+class AuthUserOut(BaseModel):
+    """注册 / 登录成功响应。"""
+
+    user: AuthUser
+
+
+class MeOut(BaseModel):
+    """当前登录用户响应。"""
+
+    user: AuthUser
+
+
 # ───────────────────────── 兼容旧名 ─────────────────────────
 # 早期 schema 用 ConversationListOut / MessageListOut 作为列表响应模型，保留以避免
 # 大范围改动 router/service。它们不在新规格里，但 router 仍引用。
@@ -166,6 +202,10 @@ __all__ = [
     "TokenEvent",
     "DoneEvent",
     "ErrorEvent",
+    "AuthCredentials",
+    "AuthUser",
+    "AuthUserOut",
+    "MeOut",
     "ConversationListOut",
     "MessageListOut",
 ]

@@ -16,8 +16,10 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app import metrics
+from app import __version__ as _APP_VERSION, metrics
 from app.admin import router as admin_router
+from app.auth.router import router as auth_router
+from app.auth.session import SESSION_COOKIE, verify_session_value
 from app.chat import router as chat_router
 from app.chat.service import shutdown_tasks, _reap_locks
 from app.config import settings
@@ -61,21 +63,34 @@ async def lifespan(app: FastAPI):
         await shutdown_tasks()
 
 
-app = FastAPI(title="Simple Chat API", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="Simple Chat API", version=_APP_VERSION, lifespan=lifespan)
 
 
 # ───────────────────────── 请求日志中间件（结构化 JSON） ─────────────────────────
+def _log_identity(request: Request) -> str:
+    """日志用身份：认证开启时优先已验证 Cookie，否则回退 header 兼容路径。
+
+    仅用于日志与 request.state，不承担权限判断；拒绝匿名请求由 UserIdDep 负责。
+    """
+    if settings.effective_auth_enabled:
+        uid = verify_session_value(request.cookies.get(SESSION_COOKIE))
+        if uid:
+            return uid
+    return request.headers.get("X-User-Id") or "anonymous"
+
+
 class RequestLogMiddleware(BaseHTTPMiddleware):
     """记录每个请求：request_id / method / path / status / latency_ms / user_id。
 
-    request_id 回写 X-Request-Id 响应头；user_id 取自 X-User-Id（缺失为 anonymous），
-    并写入 request.state 供流式断开日志复用。请求体不记录（隐私）。
+    request_id 回写 X-Request-Id 响应头；user_id 优先取已验证的会话 Cookie，
+    认证关闭时回退 X-User-Id（缺失为 anonymous），并写入 request.state 供流式
+    断开日志复用。请求体不记录（隐私），认证 Cookie 值绝不进日志。
     """
 
     async def dispatch(self, request: Request, call_next):
         request_id = request.headers.get("X-Request-Id") or uuid.uuid4().hex
         request.state.request_id = request_id
-        user_id = request.headers.get("X-User-Id") or "anonymous"
+        user_id = _log_identity(request)
         request.state.user_id = user_id
         # PR-3 改动 1：trace_id 经 contextvars 透传，供慢查询等内部日志关联请求
         metrics.trace_id.set(request_id)
@@ -217,11 +232,16 @@ async def readyz() -> JSONResponse:
 # ───────────────────────── 首页（注入模型名） ─────────────────────────
 @app.get("/", include_in_schema=False)
 async def index(request: Request) -> HTMLResponse:
-    # 注入 model 名给前端 <meta name="llm-model"> 占位（app.js 读取展示于侧边栏底部）。
+    # 注入 model 名给前端 <meta name="llm-model">（app.js 读取展示于侧边栏底部），
+    # 以及认证开关 <meta name="auth-enabled">（app.js 决定是否显示登录门）。
     html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
     html = html.replace(
         'name="llm-model" content=""',
         f'name="llm-model" content="{settings.llm_model}"',
+    )
+    html = html.replace(
+        'name="auth-enabled" content=""',
+        f'name="auth-enabled" content="{"true" if settings.effective_auth_enabled else "false"}"',
     )
     return HTMLResponse(html)
 
@@ -263,5 +283,6 @@ async def unhandled_handler(request: Request, exc: Exception) -> JSONResponse:
     return error_response(500, ErrorCode.INTERNAL_ERROR, message, rid)
 
 
+app.include_router(auth_router)  # /api/auth/*（v0.2 注册/登录/登出/me）
 app.include_router(chat_router.router)  # router 自身已带 prefix="/api/chat"
 app.include_router(admin_router)  # /api/admin/cost（PR-3 改动 2）

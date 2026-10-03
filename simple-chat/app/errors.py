@@ -18,6 +18,7 @@ class ErrorCode(str, Enum):
 
     VALIDATION_ERROR = "VALIDATION_ERROR"
     AUTH_ERROR = "AUTH_ERROR"
+    UNAUTHORIZED = "UNAUTHORIZED"
     MODEL_UNAVAILABLE = "MODEL_UNAVAILABLE"
     CONTEXT_OVERFLOW = "CONTEXT_OVERFLOW"
     RATE_LIMITED = "RATE_LIMITED"
@@ -25,6 +26,7 @@ class ErrorCode(str, Enum):
     INTERNAL_ERROR = "INTERNAL_ERROR"
     METHOD_NOT_ALLOWED = "METHOD_NOT_ALLOWED"
     CONVERSATION_BUSY = "CONVERSATION_BUSY"
+    CONFLICT = "CONFLICT"
 
     @property
     def http_status(self) -> int:
@@ -40,6 +42,7 @@ class ErrorCode(str, Enum):
 _HTTP_STATUS: dict[ErrorCode, int] = {
     ErrorCode.VALIDATION_ERROR: 422,
     ErrorCode.AUTH_ERROR: 500,
+    ErrorCode.UNAUTHORIZED: 401,
     ErrorCode.MODEL_UNAVAILABLE: 503,
     ErrorCode.CONTEXT_OVERFLOW: 413,
     ErrorCode.RATE_LIMITED: 429,
@@ -47,11 +50,13 @@ _HTTP_STATUS: dict[ErrorCode, int] = {
     ErrorCode.INTERNAL_ERROR: 500,
     ErrorCode.METHOD_NOT_ALLOWED: 405,
     ErrorCode.CONVERSATION_BUSY: 409,
+    ErrorCode.CONFLICT: 409,
 }
 
 _DEFAULT_MESSAGES: dict[ErrorCode, str] = {
     ErrorCode.VALIDATION_ERROR: "请求参数不合法",
     ErrorCode.AUTH_ERROR: "上游模型鉴权失败，请检查服务端配置",
+    ErrorCode.UNAUTHORIZED: "未登录或会话已失效",
     ErrorCode.MODEL_UNAVAILABLE: "上游模型暂时不可用",
     ErrorCode.CONTEXT_OVERFLOW: "上下文长度超限",
     ErrorCode.RATE_LIMITED: "上游限流，请稍后重试",
@@ -59,6 +64,7 @@ _DEFAULT_MESSAGES: dict[ErrorCode, str] = {
     ErrorCode.INTERNAL_ERROR: "服务内部错误",
     ErrorCode.METHOD_NOT_ALLOWED: "请求方法不被允许",
     ErrorCode.CONVERSATION_BUSY: "该会话正在生成回复，请稍候",
+    ErrorCode.CONFLICT: "资源冲突",
 }
 
 
@@ -94,6 +100,32 @@ class ValidationError(AppError):
 
     def __init__(self, message: str | None = None) -> None:
         super().__init__(ErrorCode.VALIDATION_ERROR, message)
+
+
+class UnauthorizedError(AppError):
+    """未认证 / 会话无效（401）。
+
+    注意区分 AUTH_ERROR（上游模型鉴权失败，500）与 UNAUTHORIZED（本服务用户
+    未登录，401）。登录失败也复用此错误，且文案统一，避免账号枚举。
+    """
+
+    def __init__(self, message: str | None = None) -> None:
+        super().__init__(ErrorCode.UNAUTHORIZED, message)
+
+
+class RateLimitedError(AppError):
+    """触发限流（429）；retry_after 由响应头透出，便于客户端退避。"""
+
+    def __init__(self, message: str | None = None, retry_after: int | None = None) -> None:
+        super().__init__(ErrorCode.RATE_LIMITED, message)
+        self.retry_after = retry_after
+
+
+class ConflictError(AppError):
+    """资源冲突（409），如用户名已被占用。"""
+
+    def __init__(self, message: str | None = None) -> None:
+        super().__init__(ErrorCode.CONFLICT, message)
 
 
 class NotFoundError(AppError):

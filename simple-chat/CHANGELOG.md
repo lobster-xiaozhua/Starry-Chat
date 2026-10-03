@@ -3,10 +3,18 @@
 本项目的所有重要变更记录在此文件。
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
-## v0.2.0 — 2026-10-02
+## v0.6.0 - 2026-10-03 (capability baseline: v0.2-v0.6 integrated)
+
+一次性补齐路线图 v0.2-v0.6（认证 / 路由 / 预算 / 记忆 / 工具 / RAG）并接入聊天链路；v0.7 Agent 与 v0.8 多模态未开始。详见 docs/ROADMAP.md。
+
+## v0.1.1 — 2026-10-02（release-set：无新能力，仅硬化）
 
 本版本包含 PR-1（并发与上下文正确性）、PR-2（安全与部署加固）、
 PR-3（观测性与真实链路验证）三批变更。
+
+> 版本号说明：原记为 v0.2.0，按 `docs/ROADMAP.md` 的 release-set 约定降为
+> v0.1.1——PR-1/2/3 是对既有系统的修复与硬化，不构成新的产品能力格；
+> v0.2 起为路线图中按能力递增的版本。版本号单一来源为 `app.__version__`。
 
 ### Added（PR-3）
 

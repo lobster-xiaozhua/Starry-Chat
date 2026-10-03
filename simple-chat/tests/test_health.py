@@ -11,7 +11,8 @@ async def test_healthz_ok(client):
     assert res.status_code == 200
     body = res.json()
     assert body["status"] == "ok"
-    assert body["version"] == "0.1.0"
+    from app import __version__
+    assert body["version"] == __version__
     assert "ts" in body
 
 
